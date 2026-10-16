@@ -1,0 +1,128 @@
+packages:
+  # The ESP32-P4, its memory, the ESP32-C6 for Wi-Fi and the touch bus, pin for pin the Guition P4 panels' own.
+  hardware: !include ../hardware/esp32p4-c6.yaml
+  look: !include ../looks/standard.yaml
+  touch: !include ../features/capacitive-touch.yaml
+  backlight: !include ../features/backlight.yaml
+  camera: !include ../features/camera.yaml
+  self_test: !include ../features/self-test.yaml
+  snapshot: !include ../features/snapshot.yaml
+  # The P4 transport keeps the shared speaker/microphone/player interfaces. The amplifier follows playback.
+  audio: !include ../hardware/wavesharep4-audio/${P4_AUDIO_TRANSPORT}.yaml
+  audio_settings: !include ../hardware/wavesharep4-audio/settings.yaml
+  audio_amplifier: !include ../features/audio-amplifier.yaml
+  audio_half_duplex: !include ../features/audio-half-duplex.yaml
+
+substitutions:
+# The key of this board file; the firmware reports it so ESP Screens knows what board a screen is.
+  BOARD_ID: "wavesharep47b"
+  DEVICE_NAME: "wavesharep47b-new"
+  DEVICE_FRIENDLY_NAME: "My Waveshare P4 7B"
+  
+  # The glass: the panel's own pixels and its density, 1187 diagonal pixels over its 7.0-inch diagonal.
+  PANEL_W: "1024"
+  PANEL_H: "600"
+  DISPLAY_DPI: "169.548"
+  ROTATION_LANDSCAPE: "180"
+  TOUCH_MIRROR_X: "true"
+  TOUCH_MIRROR_Y: "true"
+  GRID_COLS: "4"
+  GRID_ROWS: "4"
+  GRID_COLS_PORTRAIT: "2"
+  GRID_ROWS_PORTRAIT: "7"
+  SCREEN_MAX_TILES: "128"
+  SCREEN_MAX_PAGES: "24"
+  SCREEN_MAX_BAR_ITEMS: "12"
+  LVGL_BUFFER_SIZE: "50%"
+
+  # Hardware a screen's own YAML may change (docs/EASY_SETUP.md, "Hardware-specific YAML overrides")
+  BACKLIGHT_FREQUENCY: "1000Hz"
+
+  # One physical I2S bus, with full-duplex AEC or the original half-duplex I2S path. The ES8311 maps volume from
+  # 0 (-95.5 dB) to 255 (+32 dB), half a decibel a step.
+  P4_AUDIO_TRANSPORT: "aec"
+  AUDIO_MIC_BUS: ts_speaker_bus
+  AUDIO_DOUT_PIN: GPIO9
+  AUDIO_DIN_PIN: GPIO11
+  AUDIO_DAC_DB_AT_0: "-95.5"
+  AUDIO_DAC_DB_AT_1: "32"
+  AUDIO_AMPLIFIER: board_speaker_amp
+
+# ============================================================
+# No need to edit below this line.
+# ============================================================
+
+esphome:
+  # This board asks for more ESPHome than the packages' own min_version (packages/core.yaml): its display model,
+  # `WAVESHARE-P4-86-PANEL` below, arrived in 2026.9.0. A board file's min_version wins over the core's.
+  min_version: 2026.9.0
+
+esp32:
+  flash_size: 32MB
+  framework:
+    advanced:
+      # ESPHome asks for this ESP-IDF option for update slots on more than 16 MB of flash.
+      enable_idf_experimental_features: true
+
+# TP_INT ends at a test point, so the touch panel is read by polling.
+touchscreen:
+  - platform: gt911
+    id: ts_touch
+    display: my_display
+    i2c_id: touch_bus
+    reset_pin: GPIO23
+    address: 0x5D
+    update_interval: 20ms
+
+# The backlight, an inverted PWM pin (features/backlight.yaml makes it the light). BL_EN (GPIO33, the display's
+# enable_pin below) powers its boost converter. At most 80 % of the PWM range, as in the community configuration
+# Waveshare links to; the screen's brightness setting covers 0 to 100 % of that. Below 15 % the glass was too dark to
+# read, so the lowest level is 15 %, and zero_means_zero keeps 0 dark for standby (GitHub #209).
+output:
+  - platform: ledc
+    id: gpio_backlight_pwm
+    pin: GPIO32
+    frequency: ${BACKLIGHT_FREQUENCY}
+    inverted: true
+    max_power: 0.8
+    min_power: 0.15
+    zero_means_zero: true
+
+# ESPHome's own mipi_dsi platform knows the panel by name: the ST7703's init sequence and timings come with it.
+display:
+  - platform: mipi_dsi
+    id: my_display
+    model: WAVESHARE-ESP32-P4-WIFI6-TOUCH-LCD-7B
+    reset_pin: GPIO33
+    update_interval: never
+    auto_clear_enabled: false
+
+# The audio, as Waveshare's schematic wires it: both codecs on the touch panel's I2C bus, one I2S bus for both, and the
+# speaker's amplifier on GPIO53.
+audio_adc:
+  - platform: es7210_extended
+    id: ts_audio_adc
+    i2c_id: touch_bus
+    address: 0x40
+    sample_rate: ${AUDIO_SAMPLE_RATE}
+    bits_per_sample: 16bit
+    mic_gain: 30db
+    alc:
+      enabled: true
+
+audio_dac:
+  - platform: es8311
+    id: ts_audio_dac
+    i2c_id: touch_bus
+    address: 0x18
+    sample_rate: ${AUDIO_SAMPLE_RATE}
+    bits_per_sample: 16bit
+    use_mclk: true
+    use_microphone: false
+
+switch:
+  - platform: gpio
+    id: board_speaker_amp
+    internal: true
+    pin: GPIO53
+    restore_mode: ALWAYS_OFF
