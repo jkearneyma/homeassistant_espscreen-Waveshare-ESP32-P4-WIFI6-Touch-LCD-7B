@@ -122,12 +122,36 @@ def build_reason(logs):
 
 # A compiler error in a file of an external component: `../src/esphome/components/tap_sound/tap_sound.h:19:8: error: ...`.
 COMPONENT_ERROR = re.compile(r'components/([a-z0-9_]+)/[^\s:]+:\d+(?::\d+)?:\s*(?:fatal\s+)?error:')
+# A plugin the core refused while ESPHome read the configuration, before any compiler ran (smart_display.register_plugin):
+# `Plugin tap_sound wants plugin API 0.11; this firmware offers 0.10.` or `Plugin tap_sound was written for plugin API ...`.
+API_REFUSAL = re.compile(r'Plugin ([a-z0-9_]+) (?:wants|was written for) plugin API')
 
 
 def failed_components(logs):
-    """The components a build's compiler errors lie in, Tessera's own left out."""
-    found = {match.group(1) for line in logs or [] for match in [COMPONENT_ERROR.search(str(line))] if match}
+    """The components a build's compiler errors lie in, and the plugins the core refused by their API, Tessera's own
+    components left out."""
+    lines = [str(line) for line in logs or []]
+    found = {match.group(1) for line in lines for match in [COMPONENT_ERROR.search(line)] if match}
+    found |= {match.group(1) for line in lines for match in [API_REFUSAL.search(line)] if match}
     return found - {'smart_display', 'flash_layout'}
+
+
+# After a build went on, the screen reboots and says hello again within this many seconds; until then whether it runs
+# the plugins just built is not known.
+SETTLING = 180
+
+
+def runs(inbox, record, running, now=None):
+    """Whether the screen of `inbox` runs the installed plugin `record` at its version, by the screen's last hello
+    (`running`, Plugins.running()): True or False, or None while it cannot be known: the screen has not said (offline,
+    or a firmware from before plugins), the record is not active (building, failed), or its build went on a moment ago
+    and the screen has not said hello since. False is a plugin that crashed at boot or a firmware built without it."""
+    reported = running.get(inbox)
+    if reported is None or record.get('state', 'active') != 'active':
+        return None
+    if (now if now is not None else time.time()) - (record.get('settled') or 0) < SETTLING:
+        return None
+    return any(item.get('id') == record['id'] and item.get('version') == record.get('version') for item in reported)
 
 
 def version_tuple(text):
@@ -235,6 +259,9 @@ class Entry:
     def card(self, card_id):
         return next((card for card in self.manifest['cards'] if card['id'] == card_id), None)
 
+    def saver(self, saver_id):
+        return next((saver for saver in self.manifest.get('savers') or () if saver['id'] == saver_id), None)
+
     def link(self):
         """The plugin's folder on GitHub, at its commit."""
         if not self.repo:
@@ -294,6 +321,7 @@ class Plugins:
         self.snapshots = {}         # (id, ref) -> Entry of an installed release
         self.links = {}             # id -> Entry added with a link (a release of any repository, or a branch to test)
         self.links_checked = 0.0    # when refresh_links last asked for the linked repositories' newest releases
+        self.saver_cache = {}       # (inbox, key) -> the fetch's answer for a plugin's step of the screensaver (0.14)
         self.http = None            # the session that reads the index: never the one that holds Home Assistant's token
         self.ready = False
         self._load_cached_index()
@@ -773,6 +801,11 @@ class Plugins:
                        # Places for pictures on the tile (0.10), shown only where the screen has the memory for them.
                        'pictures': tile['pictures']}
                       for tile in manifest['tiles']],
+            # Its screensavers (plugin API 0.14): a face of a step or a step of its own, for the Screensaver card.
+            'savers': [{'id': saver['id'], 'name': words(saver['name']), 'icon': glyph(saver['icon']), 'step': saver['step'],
+                        'pictures': saver['pictures'], 'taps': saver['taps'], 'domains': saver['domains'],
+                        'options': [option(o) for o in saver['options']], 'example': words(saver.get('example'))}
+                       for saver in manifest.get('savers') or ()],
             'settings': [{'key': s['key'], 'label': words(s['label'])} for s in manifest['settings']],
             'cards': [{'id': c['id'], 'name': words(c['name'])} for c in manifest['cards']],
             'tap_actions': [{'id': a['id'], 'label': words(a['label']), 'domains': a['domains']} for a in manifest['tap_actions']],
@@ -882,6 +915,7 @@ class Plugins:
         self.scan_folders()
         listed = self.listed()
         installed = {}
+        running = self.running()
         for inbox, records in self.store.everywhere().items():
             installed[inbox] = []
             for record in records:
@@ -896,6 +930,8 @@ class Plugins:
                                          'parts': record.get('parts', []), 'values': record.get('values', {}),
                                          'consent': (record.get('consent') or {}).get('permissions'),
                                          'state': record.get('state', 'active'), 'reason': record.get('reason'),
+                                         # Whether the screen runs it (runs): the editor says so when it does not.
+                                         'running': runs(inbox, record, running),
                                          **({'failed_update': record['failed_update']} if record.get('failed_update') else {}),
                                          # Which of its secrets for this screen alone are set (never their values).
                                          'secrets': {item['id']: self.secrets.has(
@@ -929,7 +965,7 @@ class Plugins:
                 fit[screen['id']] = reasons
         return {'api': api_text(), 'plugins': [self.editor_plugin(entry, language) for entry in listed.values()],
                 'entities': entities,
-                'installed': installed, 'running': self.running(), 'secrets': secrets,
+                'installed': installed, 'running': running, 'secrets': secrets,
                 'features': features, 'fit': fit, 'likes': {'consented': self.liker.consented()},
                 'index': {'at': self.index_state['at'], 'error': self.index_state['error']},
                 'folders': {'path': str(self.folder_root()), 'errors': self.folder_errors},
@@ -1319,7 +1355,8 @@ class Plugins:
             if ok:
                 for key in ('previous', 'failed_update', 'reason'):
                     record.pop(key, None)
-                self.store.put(inbox, dict(record, state='active'))
+                # `settled`: when it went on, so the screen gets its reboot before its hello is held against it (runs).
+                self.store.put(inbox, dict(record, state='active', settled=int(time.time())))
             elif record.get('previous'):
                 back = dict(record['previous'], state='active',
                             failed_update={'version': record.get('version'), 'ref': record.get('ref'), 'reason': reason})
@@ -1684,6 +1721,92 @@ class Plugins:
                     out.append((inbox, tile))
         return out
 
+    # ---- A plugin's screensaver (plugin API 0.14, docs/PLUGINS.md "A screensaver") ----
+    def saver_kinds(self, inbox):
+        """{key: (entry, saver)} of every screensaver of a plugin this screen runs: in this app's record of the screen
+        (what it built in) and in the screen's hello (what its firmware has), `plugin:<plugin>.<saver>`."""
+        sender = getattr(self.manager, 'page_senders', {}).get(inbox)
+        out = {}
+        for item in getattr(sender, 'plugins', None) or ():
+            if not item.get('savers') or not self.store.get(inbox, item['id']):
+                continue
+            entry = self.known(item['id'], inbox)
+            for saver_id in item['savers']:
+                kind = entry.saver(saver_id) if entry else None
+                if kind:
+                    out[f'plugin:{entry.id}.{saver_id}'] = (entry, kind)
+        return out
+
+    def saver_plugins(self, screen, choice, states):
+        """What screen_saver.message needs of a screen's plugins: {'faces': {key: step}, 'steps': {key: what the step
+        draws from, None while it has nothing to show}}, or None for a screen without a plugin's screensaver."""
+        inbox = screen.get('id')
+        kinds = self.saver_kinds(inbox)
+        if not kinds:
+            return None
+        steps = {}
+        for key in choice.get('order') or ():
+            if key in kinds and kinds[key][1]['step'] == 'own':
+                setting = (choice.get('plugins') or {}).get(key) or {}
+                steps[key] = self.saver_step(inbox, key, *kinds[key], setting, states)
+        return {'faces': {key: kind['step'] for key, (_, kind) in kinds.items()}, 'steps': steps}
+
+    def saver_values(self, inbox, key, options):
+        """A plugin saver's options with its manifest's defaults, as a tile's (values_of); as they are for one this screen
+        does not have."""
+        entry, kind = self.saver_kinds(inbox).get(key, (None, None))
+        return self.values_of(entry, kind, options) if kind else dict(options or {})
+
+    def saver_step(self, inbox, key, entry, kind, setting, states):
+        """What a plugin's step of its own draws from (its fetch's answer and its entity, as a tile's `x`), or None
+        while the step has nothing to show by its manifest's `when`."""
+        options = self.values_of(entry, kind, setting.get('options'))
+        room = min(X_BUDGET, page_delivery.MAX_MESSAGE - ENVELOPE - 160 - json_size(options))
+        entity, part = self.entity_part(kind, {'options': {'plugin_entity': setting.get('entity', '')}}, room)
+        if kind['domains'] and not entity:
+            return None
+        data = self.saver_cache.get((inbox, key)) if kind.get('data') else None
+        when = kind.get('when', 'always')
+        if when == 'data' and (not data or 'wait' in data):
+            return None
+        if isinstance(when, dict) and (states.get(entity) or {}).get('state') not in when['state']:
+            return None
+        return trimmed({**(part or {}), **(data or {})}, room)
+
+    def saver_steps(self):
+        """Every plugin step of a screensaver with a fetch, on a screen whose screensaver is on: [(inbox, key, entry,
+        saver, options)]."""
+        out = []
+        manager = self.manager
+        for inbox in list(getattr(manager, 'layouts', None) or {}):
+            screen = manager.screen(inbox) if hasattr(manager, 'screen') else None
+            device = (screen or {}).get('device_id')
+            choice = manager.savers.get(device) if device and hasattr(manager, 'savers') else None
+            if not choice or not choice.get('show'):
+                continue
+            kinds = self.saver_kinds(inbox)
+            for key in choice['order']:
+                if key in kinds and key not in choice['off'] and kinds[key][1].get('data'):
+                    entry, kind = kinds[key]
+                    setting = (choice.get('plugins') or {}).get(key) or {}
+                    out.append((inbox, key, entry, kind, self.values_of(entry, kind, setting.get('options'))))
+        return out
+
+    async def refresh_savers(self):
+        """The fetches of the plugins' screensaver steps, as the tiles' (refresh_data): a pass when an answer changed."""
+        changed = False
+        seen = set()
+        for inbox, key, entry, kind, options in self.saver_steps():
+            seen.add((inbox, key))
+            data = await self.tile_data(entry, kind, options, True, inbox)
+            if self.saver_cache.get((inbox, key)) != data:
+                self.saver_cache[(inbox, key)] = data
+                changed = True
+        for gone in set(self.saver_cache) - seen:
+            del self.saver_cache[gone]
+        if changed:
+            self.manager.ha.changed.set()
+
     async def refresh_data(self):
         """One round of the fetch loop: ask what is due for every plugin tile on a screen, and send the tiles whose
         answer changed."""
@@ -1713,6 +1836,8 @@ class Plugins:
     async def loop(self):
         while True:
             try:
+                # The screensaver's steps first: the tiles' round forgets the answers nobody asked for in it.
+                await self.refresh_savers()
                 if self.plugin_tiles():
                     await self.refresh_data()
             except Exception as error:   # one plugin's trouble never stops the app

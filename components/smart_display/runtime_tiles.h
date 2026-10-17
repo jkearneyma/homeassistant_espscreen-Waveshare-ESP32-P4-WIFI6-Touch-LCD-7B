@@ -57,6 +57,7 @@
 #include "tile_picture.h"
 #include "media_card.h"
 #include "saver_view.h"
+#include "picture_motion.h"
 #include "energy_view.h"
 #include "calendar_view.h"
 #include "meter_view.h"
@@ -225,8 +226,9 @@ inline bool awake() { return !screen_awake || screen_awake(); }
 // is not awake, everything else keeps waiting for a touch.
 inline bool saver_pictures = false;
 inline bool pictures_awake() { return awake() || saver_pictures; }
-// What ESP Screen Manager says the screensaver shows (op "saver", screen_saver.py): "media", "camera", "clock" or ""
-// for none, with the player's or camera's name and, for a player, its title, artist and album, its picture's mark and
+// What ESP Screen Manager says the screensaver shows (op "saver", screen_saver.py): "media", "photos" (app 0.4.89, a
+// folder of Home Assistant's media; `entity` is screen_saver.PHOTOS_ENTITY, `picture` the photo's mark), "camera",
+// "clock", "plugin" (a plugin's step of its own, plugin API 0.14) or "" for none, with the player's or camera's name and, for a player, its title, artist and album, its picture's mark and
 // the cover's colour (the picture is made again when either changes). Where the track is, is no part of it.
 // The clock's face (module clock_faces, app `cf`): the digital clock every screen has, or Glass, Classic or Bauhaus on
 // a screen with the module. Its numerals (Glass: 0, 4 or 12), its seconds hand, and its look: dark, light or the screen's.
@@ -237,6 +239,8 @@ struct SaverFace {
   bool seconds = true;
   bool operator==(const SaverFace &o) const { return kind == o.kind && numerals == o.numerals && look == o.look && seconds == o.seconds; }
 };
+// The photos step's picture on the wire (screen_saver.PHOTOS_ENTITY): no entity of Home Assistant's, the step itself.
+inline const std::string SAVER_PHOTOS = "saver.photos";
 struct SaverChoice {
   std::string kind, entity, name, title, artist, album, picture, ground;
   SaverFace face;
@@ -247,10 +251,17 @@ struct SaverChoice {
   std::string state;
   uint32_t features = 0;
   bool muted = false;
+  // A plugin's face of this step or a plugin's own step (plugin API 0.14, app `pf`): its key (plugin:<plugin>.<saver>),
+  // and its options and what it draws from as the app sent them ({"o": ..., "x": ...}), handed to the plugin as they are.
+  std::string plugin;
+  roomy::Text plugin_data;
+  // The photos step's photo moves slowly (app `x.mv`, picture_motion.h).
+  bool motion = false;
   bool operator==(const SaverChoice &o) const {
     return kind == o.kind && entity == o.entity && name == o.name && title == o.title && artist == o.artist &&
            album == o.album && picture == o.picture && ground == o.ground && weather == o.weather && row == o.row &&
-           state == o.state && features == o.features && muted == o.muted && face == o.face;
+           state == o.state && features == o.features && muted == o.muted && face == o.face && plugin == o.plugin &&
+           plugin_data == o.plugin_data && motion == o.motion;
   }
 };
 inline SaverChoice saver_next, saver_now;  // the app's latest word, and what the glass shows
@@ -260,16 +271,17 @@ inline lv_obj_t *saver_root = nullptr;      // the clock
 inline lv_obj_t *saver_first = nullptr, *saver_second = nullptr;
 inline bool saver_words_due = false;
 // A player's keys over its cover (firmware 0.33.0+): volume up, volume down, play or pause. They take their own tap, so
-// the screen stays in standby; a touch anywhere else wakes it. `saver_flipped`: when the play key last showed the other
-// face ahead of Home Assistant's word.
+// the screen stays in standby; a touch anywhere else wakes it. What a key changes shows at once and is squared with Home
+// Assistant's word as every control's (saver_wish, docs/OPTIMISTIC.md).
 inline std::array<lv_obj_t *, 3> saver_keys{};
-inline uint32_t saver_flipped = 0;
 inline void saver_keys_draw();
 // A next track that came while a picture was on its way (firmware 0.32.0+): followed once that load has ended, so the
 // online_image never gets a second link in the middle of a download and the one that lands is the one asked for.
 inline bool saver_follow_due = false;
 inline void saver_follow_pending();
 inline bool saver_camera = false;           // the camera's full view on the glass is the screensaver's (a camera or a cover)
+// The full view is the backdrop of a plugin's face (plugin API 0.14, `backdrop: true`): the picture alone, no words, no keys.
+inline bool saver_bare = false;
 inline void saver_words();
 inline bool saver_woke = false;  // the last wake took the screensaver away: that touch does nothing else
 inline void saver_tick(uint32_t now);
@@ -855,6 +867,7 @@ inline bool watch_call(esphome::api::HomeassistantActionRequest &request, const 
         silent = true;
         t.pending = false;
         t.release_slider();
+        t.release_travel();
         t.refused_at = std::max<uint32_t>(1, esphome::millis());
         t.unanswered = true;
         refresh_tile(i);
@@ -884,6 +897,7 @@ inline bool watch_call(esphome::api::HomeassistantActionRequest &request, const 
     for (size_t i = 0; i < model.tiles.size(); ++i) if (model.tiles[i].entity == entity) {
       model.tiles[i].pending = false;
       model.tiles[i].release_slider();
+      model.tiles[i].release_travel();
       model.tiles[i].refused_at = std::max<uint32_t>(1, esphome::millis());
       model.tiles[i].unanswered = false;
       refresh_tile(i);
@@ -1359,11 +1373,141 @@ inline void climate_power(Tile &t) {
   t.begin(esphome::millis());
   action(t.domain() + ".turn_on", t.entity);
 }
+// A cover's command (cover_travel.h): every tile and the card of the cover show where it goes and which way at once,
+// and the action goes out without the busy sheet, so a finger can send the cover elsewhere while it is on its way.
+// `to` the position or tilt asked for, `dir` +1 open, -1 close, 0 from the positions. A stop ends the travel: Home
+// Assistant's next report says where the cover stood still.
+inline void cover_go(Tile &t, const tile_controls::Action &a, float to, int dir, bool tilt = false) {
+  if (!a.valid()) return;
+  const uint32_t now = esphome::millis();
+  const bool stop = a.service == "cover.stop_cover" || a.service == "cover.stop_cover_tilt";
+  const std::string entity = t.entity;
+  for (size_t i = 0; i < model.tiles.size(); ++i) {
+    auto &o = model.tiles[i];
+    if (o.entity != entity) continue;
+    o.release_travel();
+    if (!stop) o.travel_start(now, to, dir, tilt);
+    o.refused_at = 0;
+    refresh_tile(i);
+  }
+  action(a.service, entity, a.key, a.value, true, "", "", false);
+}
+// A cover's key: open and close travel to their end, the stops end a travel.
+inline void cover_key(Tile &t, int command) {
+  const auto a = tile_controls::key_action(t, command);
+  switch (command) {
+    case tile_controls::COVER_OPEN: cover_go(t, a, 100, 1); break;
+    case tile_controls::COVER_CLOSE: cover_go(t, a, 0, -1); break;
+    // A blind open at 50 (tilt_open) opens to 50 and closes to the nearer end, down from the middle; the way follows.
+    case tile_controls::COVER_OPEN_TILT: t.tilt_middle ? cover_go(t, a, 50, 0, true) : cover_go(t, a, 100, 1, true); break;
+    case tile_controls::COVER_CLOSE_TILT:
+      if (t.tilt_middle) cover_go(t, a, std::isfinite(t.extra().tilt) && t.extra().tilt > 50 ? 100 : 0, 0, true);
+      else cover_go(t, a, 0, -1, true);
+      break;
+    default: cover_go(t, a, NAN, 0); break;
+  }
+}
+// A cover slider while its cover is on its way (cover_travel.h). The fill stands faint at the target and the handle is
+// gone, so nothing looks as if it waits for a finger, and a thin stripe glides over the slider from where Home Assistant
+// last had the cover towards where it goes, about once a second: the cover moves, and which way, also where it cannot
+// be seen. The slider still takes a finger: a press brings the handle back (the pressed state outranks the travel's)
+// and the release sends the cover elsewhere. The slats' slider has no fill, so its handle goes faint instead.
+// Only the sliders on the glass are redrawn, by one timer that lives while a stripe runs.
+namespace travel_stripe {
+struct Run { lv_obj_t *slider = nullptr; int from = 0, to = 0; };
+inline std::array<Run, 8> runs{};
+inline lv_timer_t *timer = nullptr;
+constexpr uint32_t PERIOD = 1100, FRAME = 50;
+inline Run *find(lv_obj_t *slider) {
+  for (auto &r : runs) if (r.slider == slider) return &r;
+  return nullptr;
+}
+inline void tick(lv_timer_t *) {
+  bool any = false;
+  for (auto &r : runs) if (r.slider) { lv_obj_invalidate(r.slider); any = true; }
+  if (!any && timer) { lv_timer_delete(timer); timer = nullptr; }
+}
+// The slider's pixel along its axis for a raw value, in its own range (a reversed range runs the other way).
+inline int at(lv_obj_t *slider, const lv_area_t &c, int raw) {
+  const int lo = lv_slider_get_min_value(slider), hi = lv_slider_get_max_value(slider);
+  const float share = hi == lo ? 0.0f : std::clamp((raw - lo) / float(hi - lo), 0.0f, 1.0f);
+  const bool lying = lv_area_get_width(&c) >= lv_area_get_height(&c);
+  return lying ? c.x1 + (int) std::lround(share * (lv_area_get_width(&c) - 1))
+               : c.y2 - (int) std::lround(share * (lv_area_get_height(&c) - 1));
+}
+inline void draw(lv_event_t *e) {
+  auto *slider = lv_event_get_target_obj(e);
+  const Run *r = find(slider);
+  if (!r || lv_obj_has_state(slider, LV_STATE_PRESSED)) return;
+  lv_area_t c;
+  lv_obj_get_coords(slider, &c);
+  const bool lying = lv_area_get_width(&c) >= lv_area_get_height(&c);
+  const int a = at(slider, c, r->from), b = at(slider, c, r->to), span = std::abs(b - a);
+  const int across = lying ? lv_area_get_height(&c) : lv_area_get_width(&c);
+  if (span < 2) return;
+  // One thin stripe across the slider, as long as half its width, glides from where the cover was to where it goes,
+  // slowing as it arrives, and fades in at the start and out at the end; it never reaches the slider's rounded ends.
+  const int thick = std::max(3, across / 14), half = thick / 2;
+  const int length = std::max(thick, across / 2);
+  const float phase = (esphome::millis() % PERIOD) / float(PERIOD), eased = 1.0f - (1.0f - phase) * (1.0f - phase);
+  const int lo_end = (lying ? c.x1 : c.y1) + across / 4, hi_end = (lying ? c.x2 : c.y2) - across / 4;
+  const int at_ = std::clamp(a + (int) std::lround((b - a) * eased), lo_end, hi_end);
+  const float fade = std::min({1.0f, phase / 0.2f, (1.0f - phase) / 0.25f});
+  lv_draw_rect_dsc_t d;
+  lv_draw_rect_dsc_init(&d);
+  d.bg_color = lv_color_hex(cover_paint::ACCENT);
+  d.bg_opa = (lv_opa_t) std::lround(LV_OPA_80 * fade);
+  d.radius = LV_RADIUS_CIRCLE;
+  const int middle = lying ? (c.y1 + c.y2) / 2 : (c.x1 + c.x2) / 2;
+  lv_area_t stripe = lying ? lv_area_t{at_ - half, middle - length / 2, at_ - half + thick - 1, middle + length / 2}
+                           : lv_area_t{middle - length / 2, at_ - half, middle + length / 2, at_ - half + thick - 1};
+  lv_draw_rect(lv_event_get_layer(e), &d, &stripe);
+}
+inline void forget(lv_event_t *e) {
+  if (Run *r = find(lv_event_get_target_obj(e))) *r = Run();
+}
+// The stripe of one slider: from and to in the slider's raw values, or none.
+inline void set(lv_obj_t *slider, bool on, int from, int to) {
+  Run *r = find(slider);
+  if (!on) { if (r) { *r = Run(); lv_obj_invalidate(slider); } return; }
+  if (!r) {
+    r = find(nullptr);
+    if (!r) return;
+    // Once per slider, however often a cover on it travels.
+    lv_obj_remove_event_cb(slider, draw);
+    lv_obj_remove_event_cb(slider, forget);
+    lv_obj_add_event_cb(slider, draw, LV_EVENT_DRAW_MAIN_END, nullptr);
+    lv_obj_add_event_cb(slider, forget, LV_EVENT_DELETE, nullptr);
+  }
+  r->slider = slider;
+  r->from = from;
+  r->to = to;
+  if (!timer) timer = lv_timer_create(tick, FRAME, nullptr);
+}
+}  // namespace travel_stripe
+// `closed`: the slider holds the closed share (a standing blind, a tile's strip), else the open share or the tilt.
+inline void travel_look(lv_obj_t *slider, const Tile &t, bool tilt, bool closed) {
+  if (!slider) return;
+  const bool on = t.travelling() && t.travel.tilt == tilt;
+  auto raw = [&](float v) { return (int) std::lround(std::clamp(closed ? 100.0f - v : v, 0.0f, 100.0f) * 10); };
+  const float from = t.travel.real, to = t.travel.to;
+  travel_stripe::set(slider, on && std::isfinite(to), std::isfinite(from) ? raw(from) : raw(to < 50 ? 100 : 0), raw(to));
+  if (on == lv_obj_has_state(slider, LV_STATE_USER_1)) return;
+  if (on) {
+    if (!tilt) lv_obj_set_style_bg_opa(slider, LV_OPA_40, LV_PART_INDICATOR | LV_STATE_USER_1);
+    lv_obj_set_style_opa(slider, tilt ? LV_OPA_40 : LV_OPA_TRANSP, LV_PART_KNOB | LV_STATE_USER_1);
+    lv_obj_set_style_opa(slider, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_USER_1 | LV_STATE_PRESSED);
+    lv_obj_add_state(slider, LV_STATE_USER_1);
+  } else {
+    lv_obj_remove_state(slider, LV_STATE_USER_1);
+  }
+}
 // A key of a tile (a wide tile's row, a thermostat's mode bar): a wish where the key changes a value it can show
 // (tile_controls::wanted), the plain action otherwise.
 inline void key_press(Tile &t, int command, const std::string &arg = "") {
   const auto a = tile_controls::key_action(t, command, arg);
   if (!a.valid()) return;
+  if (t.domain() == "cover") { cover_key(t, command); return; }
   const auto w = tile_controls::wanted(t, command, arg);
   if (!w.valid) { action(a.service, t.entity, a.key, a.value); return; }
   if (w.field == optimistic::Field::HVAC_MODE) { climate_mode_wish(t, w.value); return; }
@@ -1457,7 +1601,8 @@ inline void commit_slider(unsigned i,int raw,bool tilt=false){
   if(d=="cover"){
     if(tilt&&!tile_controls::cover_tilt_selected(t))return;
     const auto call=tile_controls::cover_position_action(t,raw,tilt);
-    if(call.valid())action(call.service,t.entity,call.key,call.value);
+    const float percent=std::lround(std::clamp(raw,0,1000)/10.0f);
+    cover_go(t,call,tilt?percent:100-percent,0,tilt);
     return;
   }
   if(tilt)return;
@@ -1680,7 +1825,7 @@ inline void detail_command(int cmd){
     return;
   }
   // Cover keys: 70 + tile_controls::Command (open, stop, close and the tilt keys).
-  if(cmd>=70 && cmd<130){auto a=tile_controls::key_action(t,cmd-70);if(a.valid()&&t.domain()=="cover")action(a.service,t.entity,a.key,a.value);}
+  if(cmd>=70 && cmd<130){if(t.domain()=="cover")cover_key(t,cmd-70);}
   if(cmd==40)action(t.state=="active"?"timer.pause":"timer.start",t.entity);
   if(cmd==41)action("timer.cancel",t.entity);
   // The climate card: a mode (200-207), a fan or swing choice (210-221) and the power key (230). The card
@@ -1735,17 +1880,9 @@ inline int text_width(const std::string &text,const lv_font_t *font){
   lv_point_t size;lv_text_get_size(&size,text.c_str(),font,0,0,LV_COORD_MAX,LV_TEXT_FLAG_NONE);return size.x;
 }
 // ---- Weather card: now, the next hours and the coming days, with rain ----
-// The colour of a condition's icon, as this look draws it on a card.
-inline uint32_t weather_color_raw(const std::string &c) {
-  using namespace theme::ha;
-  if(c=="sunny")return SUNNY;
-  if(c=="clear-night")return DEEP_PURPLE;
-  if(c=="rainy"||c=="pouring"||c=="lightning-rainy"||c=="snowy-rainy")return RAIN;
-  if(c=="snowy"||c=="hail")return SNOW;
-  if(c=="lightning")return LIGHTNING;
-  if(c=="partlycloudy")return PARTLY_CLOUDY;
-  return CLOUDY;
-}
+// The colour of a condition's icon on a card: the sky of the one weather table (tile_controls::weather_sky), the same the
+// chart beside it draws its marks in.
+inline uint32_t weather_color_raw(const std::string &c) { return tile_controls::weather_sky(c); }
 inline uint32_t weather_accent(const std::string &c) { return theme::foreground(weather_color_raw(c)); }
 inline lv_obj_t *detail_text(lv_obj_t *parent,const std::string &text,int x,int y,int width,const lv_font_t *font,lv_text_align_t align,uint32_t color){
   auto *l=detail_label(parent,text,x,y,std::max(1,width));lv_obj_set_style_text_font(l,font,0);lv_obj_set_height(l,lv_font_get_line_height(font));
@@ -2449,12 +2586,14 @@ inline void cover_slider_event(lv_event_t *e){
   if(code!=LV_EVENT_RELEASED||detail_index>=model.count)return;
   auto &t=model.tiles[detail_index];
   if(!fresh()||!t.available()||!screen_input::touch_guard.accept_slider(esphome::millis(),390+(tilt?1:0)))return;
-  const auto call=tile_controls::cover_position_action(t,lv_slider_get_value(slider),tilt);
-  if(call.valid())action(call.service,t.entity,call.key,call.value);
+  const int raw=lv_slider_get_value(slider);
+  const auto call=tile_controls::cover_position_action(t,raw,tilt);
+  const float percent=std::lround(std::clamp(raw,0,1000)/10.0f);
+  cover_go(t,call,tilt?percent:100-percent,0,tilt);
 }
 // One slider. The position fills from the top by how far the cover is closed; the tilt has no fill and its
 // handle moves over the slats, drawn at their angle (firmware 0.57.0).
-inline lv_obj_t *cover_slider(lv_obj_t *parent,int x,int y,int w,int h,float value,bool tilt,lv_event_cb_t callback=nullptr,void *user=nullptr){
+inline lv_obj_t *cover_slider(lv_obj_t *parent,int x,int y,int w,int h,float value,bool tilt,lv_event_cb_t callback=nullptr,void *user=nullptr,bool middle=false){
   int radius=std::max(8,w/7),handle_h=std::max(4,w/18),handle_w=tilt?w*3/5:w*2/5,inset=std::max(6,w/9);
   if(tilt)detail_shape(parent,x,y,w,h,cover_track(),radius);
   auto *slider=lv_slider_create(parent);lv_obj_remove_style_all(slider);
@@ -2476,7 +2615,7 @@ inline lv_obj_t *cover_slider(lv_obj_t *parent,int x,int y,int w,int h,float val
     int margin=1000*(inset+handle_h)/std::max(1,h-2*(inset+handle_h));
     lv_slider_set_range(slider,-margin,1000+margin);
     lv_slider_set_value(slider,std::isfinite(value)?(int)std::lround(std::clamp(value,0.0f,100.0f)*10):500,LV_ANIM_OFF);
-    lv_obj_add_event_cb(slider,cover_paint::slats_draw,LV_EVENT_DRAW_MAIN_BEGIN,nullptr);
+    lv_obj_add_event_cb(slider,cover_paint::slats_draw,LV_EVENT_DRAW_MAIN_BEGIN,(void*)(uintptr_t)(middle?1:0));
   }else{
     lv_obj_set_style_pad_top(slider,inset+handle_h-w/2,LV_PART_KNOB);lv_obj_set_style_pad_bottom(slider,1-inset-w/2,LV_PART_KNOB);
     // Reversed, the fill hangs from the top; the stub past 0 holds the handle of a cover that is fully open.
@@ -2499,9 +2638,9 @@ inline void slider_handle(lv_obj_t *slider,int width,int height);
 // cover-tilt-position tile features: the position fills from the left by how far the cover is open, with the white
 // handle of every tile bar (slider_handle); the tilt keeps its slats and its accent handle. A lying position slider holds
 // the open share, so its value is turned around before it goes out (cover_bar_raw).
-inline lv_obj_t *cover_bar(lv_obj_t *parent,int x,int y,int w,int h,float value,bool tilt,lv_event_cb_t callback,void *user){
+inline lv_obj_t *cover_bar(lv_obj_t *parent,int x,int y,int w,int h,float value,bool tilt,lv_event_cb_t callback,void *user,bool middle=false){
   lv_obj_t *slider=nullptr;
-  if(tilt)slider=cover_paint::tilt_bar(parent,x,y,w,h,value);
+  if(tilt)slider=cover_paint::tilt_bar(parent,x,y,w,h,value,middle);
   else{
     slider=lv_slider_create(parent);lv_obj_remove_style_all(slider);
     lv_obj_set_pos(slider,x,y);lv_obj_set_size(slider,w,h);lv_slider_set_orientation(slider,LV_SLIDER_ORIENTATION_HORIZONTAL);
@@ -2591,6 +2730,7 @@ inline int cover_columns(const Tile &t,bool large){
 // A position (arg 0) or tilt (arg 1) slider follows the blind as it moves, unless a finger holds it.
 inline float cover_value(const Tile &t,bool tilt){return tilt?t.extra().tilt:t.position;}
 inline void cover_slider_paint(lv_obj_t *slider,const Tile &t,const CardPart &part){
+  travel_look(slider,t,part.arg,!part.arg);
   if(lv_obj_has_state(slider,LV_STATE_PRESSED))return;
   const float v=cover_value(t,part.arg);
   const int raw=part.arg?(std::isfinite(v)?(int)std::lround(std::clamp(v,0.0f,100.0f)*10):500)
@@ -2667,7 +2807,7 @@ inline void render_cover_detail(Tile &t,bool large,int width,int height,int pad,
       int slider_h=box_h-2*edge-value_h-caption_h+4;
       int x=pad+(box_w-(count*slider_w+(count-1)*slider_gap))/2;
       for(int i=0;i<count;++i,x+=slider_w+slider_gap){
-        card_bind(cover_slider(detail_root,x,top+edge,slider_w,slider_h,parts[i].value,parts[i].tilt),t,cover_slider_paint,"",parts[i].tilt);
+        card_bind(cover_slider(detail_root,x,top+edge,slider_w,slider_h,parts[i].value,parts[i].tilt,nullptr,nullptr,t.tilt_middle),t,cover_slider_paint,"",parts[i].tilt);
         int ty=top+edge+slider_h+2,room=slider_w+slider_gap-4;
         cover_values[parts[i].tilt?1:0]=card_bind(detail_text(detail_root,percent(parts[i].value),x-(room-slider_w)/2,ty,room,big,LV_TEXT_ALIGN_CENTER,theme::INK),t,cover_value_paint,"",parts[i].tilt);
         detail_text(detail_root,parts[i].caption,x-(room-slider_w)/2,ty+value_h,room,text,LV_TEXT_ALIGN_CENTER,theme::SUBTLE);
@@ -2677,7 +2817,7 @@ inline void render_cover_detail(Tile &t,bool large,int width,int height,int pad,
       int slider_h=box_h-2*edge,label_w=side_label;
       int column=slider_w+8+label_w,x=pad+(box_w-(count*column+(count-1)*slider_gap))/2;
       for(int i=0;i<count;++i,x+=column+slider_gap){
-        card_bind(cover_slider(detail_root,x,top+edge,slider_w,slider_h,parts[i].value,parts[i].tilt),t,cover_slider_paint,"",parts[i].tilt);
+        card_bind(cover_slider(detail_root,x,top+edge,slider_w,slider_h,parts[i].value,parts[i].tilt,nullptr,nullptr,t.tilt_middle),t,cover_slider_paint,"",parts[i].tilt);
         int ty=top+(box_h-value_h-caption_h)/2;
         cover_values[parts[i].tilt?1:0]=card_bind(detail_text(detail_root,percent(parts[i].value),x+slider_w+8,ty,label_w,big,LV_TEXT_ALIGN_LEFT,theme::INK),t,cover_value_paint,"",parts[i].tilt);
         detail_text(detail_root,parts[i].caption,x+slider_w+8,ty+value_h,label_w,text,LV_TEXT_ALIGN_LEFT,theme::SUBTLE);
@@ -3041,6 +3181,7 @@ inline climate_card::Metrics climate_metrics(bool large){
   m.small_number_w=text_width("-88.8°",small_number);
   m.caption_h=lv_font_get_line_height(small);
   m.text_h=lv_font_get_line_height(text);
+  m.status_h=m.text_h;  // the state line is written in the text font: on dense glass taller than the default 25 px
   m.icon_h=icons?lv_font_get_line_height(icons):m.text_h;
   const auto bar=detail_bar::metrics();
   m.bar=bar.key;m.bar_x=bar.x;m.bar_y=bar.y;
@@ -7467,7 +7608,7 @@ inline int layout_panel(Widgets &w,const Tile &t,bool large,int content_w,int co
       if(volume){
         lv_obj_set_pos(w.control_slider,0,0);
         // Keep the dragged value while the command is under way; HA's report takes over afterwards.
-        if(!lv_obj_has_state(w.control_slider,LV_STATE_PRESSED) && !(t.pending && !t.confirmed))lv_slider_set_value(w.control_slider,slider_value(t),LV_ANIM_OFF);
+        travel_look(w.control_slider,t,false,true);if(!lv_obj_has_state(w.control_slider,LV_STATE_PRESSED) && !(t.pending && !t.confirmed))lv_slider_set_value(w.control_slider,slider_value(t),LV_ANIM_OFF);
         panel_w=pair_w;panel_h=key_y+m.key_h;
       }
     }
@@ -7495,7 +7636,7 @@ inline int layout_panel(Widgets &w,const Tile &t,bool large,int content_w,int co
     if(has_slider){
       lv_obj_remove_flag(w.control_slider,LV_OBJ_FLAG_HIDDEN);lv_obj_set_pos(w.control_slider,0,(panel_h-m.slider_h)/2);
       // Keep the dragged value while the command is under way; HA's report takes over afterwards.
-      if(!lv_obj_has_state(w.control_slider,LV_STATE_PRESSED) && !(t.pending && !t.confirmed))lv_slider_set_value(w.control_slider,slider_value(t),LV_ANIM_OFF);
+      travel_look(w.control_slider,t,false,true);if(!lv_obj_has_state(w.control_slider,LV_STATE_PRESSED) && !(t.pending && !t.confirmed))lv_slider_set_value(w.control_slider,slider_value(t),LV_ANIM_OFF);
       panel_w=track;
     }else lv_obj_add_flag(w.control_slider,LV_OBJ_FLAG_HIDDEN);
     if(mode=="volume"){
@@ -7871,7 +8012,8 @@ inline cover_tile::Layout cover_tile_layout(const Tile &t,tall_tile::Rect body,i
     position&&card.keys?tile_controls::cover_keys(t,keys):0,t.row_span()>1||t.full);
 }
 // A cover card whose slats share one row with its primary control (cover_tile::SWAP) shows one of the two: the swap key
-// turns it. By the tile's index, so it stays while the card is drawn again; a new layout starts at the primary.
+// turns it. By the tile's index, so it stays while the card is drawn again; a new layout starts at the primary
+// (cancel_layout_input clears the table, so an index that is another cover's now does not inherit the swap).
 inline std::array<uint8_t,TILES_MAX> cover_swapped{};
 inline void render_cover_tile(Widgets &w,const Tile &t,const cover_tile::Layout &l,int width,int height);
 // Both overlay and tile use the same feature-filtered cover commands. Slot ownership is resolved on every tap;
@@ -7891,8 +8033,7 @@ inline void cover_tile_key_event(lv_event_t *e){
   const unsigned group=part/3,count=group==1?tile_controls::cover_tilt_keys(t,keys):group==2?tile_controls::cover_keys(t,keys):tile_controls::keys_for(t,keys);
   if(part%3>=count||keys[part%3].disabled)return;
   if(!screen_input::touch_guard.accept(esphome::millis(),600+tag))return;
-  const auto call=tile_controls::key_action(t,keys[part%3].command);
-  if(!call.service.empty())action(call.service,t.entity,call.key,call.value);
+  cover_key(model.tiles[w.index],keys[part%3].command);
 }
 inline void render_cover_tile(Widgets &w,const Tile &t,const cover_tile::Layout &l,int width,int height){
   hide_panel(w);
@@ -7930,10 +8071,11 @@ inline void render_cover_tile(Widgets &w,const Tile &t,const cover_tile::Layout 
     }
     if(g.slider){
       auto *&slider=w.parts[2+i];
-      if(!slider)slider=g.lying?cover_bar(w.extra,g.control.x,g.control.y,g.control.w,g.control.h,value,i,slider_event,nullptr)
-                               :cover_slider(w.extra,g.control.x,g.control.y,g.control.w,g.control.h,value,i,slider_event,nullptr);
+      if(!slider)slider=g.lying?cover_bar(w.extra,g.control.x,g.control.y,g.control.w,g.control.h,value,i,slider_event,nullptr,t.tilt_middle)
+                               :cover_slider(w.extra,g.control.x,g.control.y,g.control.w,g.control.h,value,i,slider_event,nullptr,t.tilt_middle);
       if(captured_slider!=slider)lv_slider_set_value(slider,std::isfinite(value)?(int)std::lround((i||g.lying?value:100-value)*10):(i?500:0),LV_ANIM_OFF);
       if(ready)lv_obj_remove_state(slider,LV_STATE_DISABLED);else lv_obj_add_state(slider,LV_STATE_DISABLED);
+      travel_look(slider,t,i==1,i!=1&&!g.lying);
     }else{
       std::array<tile_controls::Key,3> keys;
       const unsigned count=i==1?tile_controls::cover_tilt_keys(t,keys):i==2?tile_controls::cover_keys(t,keys):tile_controls::keys_for(t,keys);
@@ -8443,6 +8585,7 @@ inline void render_full(Widgets &w,const Tile &t,bool custom,bool clock,bool sun
     lv_obj_set_size(w.slider,content_w,strip);lv_obj_set_ext_click_area(w.slider,slider_zone(w,strip));
     slider_handle(w.slider,content_w,strip);
     lv_obj_remove_flag(w.slider,LV_OBJ_FLAG_HIDDEN);
+    travel_look(w.slider,t,false,true);
     if(!lv_obj_has_state(w.slider,LV_STATE_PRESSED) && lv_slider_get_value(w.slider)!=slider_value(t))lv_slider_set_value(w.slider,slider_value(t),LV_ANIM_OFF);
     return;
   }
@@ -8864,7 +9007,7 @@ inline void render_slot(size_t slot) {
   }else lv_obj_add_flag(w.unit,LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_size(w.slider,content_w,slider_height);lv_obj_set_ext_click_area(w.slider,slider_zone(w,slider_height));
   slider_handle(w.slider,content_w,slider_height);
-  if(mini){lv_obj_remove_flag(w.slider,LV_OBJ_FLAG_HIDDEN);if(!lv_obj_has_state(w.slider,LV_STATE_PRESSED) && lv_slider_get_value(w.slider)!=slider_value(t))lv_slider_set_value(w.slider,slider_value(t),LV_ANIM_OFF);}
+  if(mini){lv_obj_remove_flag(w.slider,LV_OBJ_FLAG_HIDDEN);travel_look(w.slider,t,false,true);if(!lv_obj_has_state(w.slider,LV_STATE_PRESSED) && lv_slider_get_value(w.slider)!=slider_value(t))lv_slider_set_value(w.slider,slider_value(t),LV_ANIM_OFF);}
   else lv_obj_add_flag(w.slider,LV_OBJ_FLAG_HIDDEN);
   lap(swipe_profile::GEOMETRY);
   if(graph_strip)render_graph(w,t,large_tile,0,content_h-slider_height,content_w,slider_height);
@@ -9606,9 +9749,17 @@ inline bool check_tile_geometry() {
     lv_area_t title,value,track,content;
     lv_obj_get_content_coords(w.tile,&content);
     lv_obj_get_coords(w.title,&title);lv_obj_get_coords(w.value,&value);
-    bool custom=lv_obj_has_flag(w.title,LV_OBJ_FLAG_HIDDEN);
-    const bool extended=w.index<model.count&&model.tiles[w.index].row_span()>1&&!w.full&&(w.extra_mode=="tall"||w.extra_mode=="cover_tilt");
+    // A camera's or a map's picture fills the card (render_camera_card): its name, if any, stands at the bottom on the
+    // picture and the state line, the icon and the parts are hidden, so only the name's place is checked here.
+    const bool picture_card=w.index<model.count&&(model.tiles[w.index].live()||model.tiles[w.index].is_map())&&w.extra_mode=="tall";
+    bool custom=lv_obj_has_flag(w.title,LV_OBJ_FLAG_HIDDEN)||picture_card;
+    const bool extended=!picture_card&&w.index<model.count&&model.tiles[w.index].row_span()>1&&!w.full&&(w.extra_mode=="tall"||w.extra_mode=="cover_tilt");
     bool fits=true;
+    if(picture_card&&!lv_obj_has_flag(w.title,LV_OBJ_FLAG_HIDDEN)){
+      const bool named=title.x1>=content.x1&&title.x2<=content.x2&&title.y1>=content.y1&&title.y2<=content.y2;
+      if(!named)ESP_LOGE("ui_test","Picture name bounds slot=%u title=%d,%d..%d,%d content=%d,%d..%d,%d",(unsigned)w.index,(int)title.x1,(int)title.y1,(int)title.x2,(int)title.y2,(int)content.x1,(int)content.y1,(int)content.x2,(int)content.y2);
+      fits=fits&&named;
+    }
     if(w.index<model.count && model.tiles[w.index].height>1 && tile_grid){
       const int gap=lv_obj_get_style_pad_row(tile_grid,LV_PART_MAIN);
       const int cell=(lv_obj_get_content_height(tile_grid)-(int)(grid.rows-1)*gap)/(int)grid.rows;
@@ -9761,7 +9912,9 @@ inline bool check_tile_geometry() {
     // clock's parts are held to the card's border instead of its content area.
     // The clock's digits are placed by their glyphs (firmware 0.3.6+): the empty top and bottom of a big font's line
     // box may stand in the padding too, the digits themselves stay in the content area.
-    const bool dial=w.extra_mode=="calendar" || w.extra_mode=="analog" || w.extra_mode=="calm" || w.extra_mode=="flip" || w.extra_mode=="digital" || w.extra_mode=="bedside";
+    // The calendar card's canvas covers the whole card, its padding too (calendar_view.cpp), and paints its plan in the
+    // content's coordinates: it is held to the card's border as well.
+    const bool dial=w.extra_mode=="calendar" || w.extra_mode=="calendar_card" || w.extra_mode=="analog" || w.extra_mode=="calm" || w.extra_mode=="flip" || w.extra_mode=="digital" || w.extra_mode=="bedside";
     lv_area_t card_box;lv_obj_get_coords(w.tile,&card_box);
       for(auto *p:w.parts){
         if(!p || lv_obj_has_flag(p,LV_OBJ_FLAG_HIDDEN))continue;
@@ -10416,7 +10569,13 @@ inline void swipe_test(unsigned count, unsigned interval_ms, unsigned back_ms) {
 inline uint32_t last_live_second=0;
 inline int last_clock_minute=-2;
 inline bool was_fresh=false;
+inline void saver_wish_tick(uint32_t now);
+inline void saver_motion_tick(uint32_t now);
 inline void tick() {
+  // A finger's wish on the screensaver's player goes out, or comes back without a word (saver_wish).
+  saver_wish_tick(esphome::millis());
+  // A photo of the screensaver that moves takes its next pixel.
+  saver_motion_tick(esphome::millis());
 #ifndef ESP_SCREEN_HOST
   // Asked to hang the other way (hang): the answer went out, the preferences are written, the screen starts again.
   if (turn_restart_at && esphome::millis() - turn_restart_at > 500) { turn_restart_at = 0; esphome::App.safe_reboot(); }
@@ -10516,6 +10675,8 @@ inline void tick() {
     if(t.refused_at && esphome::millis()-t.refused_at>=4000){t.refused_at=0;card(i);}
     // A held slider whose light never got there shows what Home Assistant last reported again.
     if(std::isfinite(t.slider_sent) && !t.slider_holding(esphome::millis())){t.release_slider();card(i);}
+    // A cover that gave no sign of getting where it was sent shows where Home Assistant last said it is.
+    if(t.travelling() && !cover_travel::holding(t.travel,esphome::millis())){t.release_travel();card(i);}
     if(!t.pending || t.waiting(esphome::millis()))continue;
     end_wait(i);card(i);
   }
@@ -11828,7 +11989,8 @@ inline void map_keys_place() {
 }
 
 inline void camera_open(const std::string &entity, const std::string &name, int map_index, const std::string &focus) {
-  if (!camera_supported() || !valid_entity(entity)) return;
+  // The screensaver's photos (app 0.4.89) open the full view as a camera does, under the step's own name.
+  if (!camera_supported() || (!valid_entity(entity) && entity != SAVER_PHOTOS)) return;
   camera_close();
   camera_map_index = map_index;
   // Opened on someone (a person tile tapped): focused from the start, and Back closes the map at once.
@@ -11992,6 +12154,8 @@ inline void camera_answer(const std::string &view, const std::string &entity, co
     tile_picture_answer(number, url, now);
   } else if (view == "pcard") {  // the pictures of a plugin's card over the page (plugin API 0.13)
     plugin_host::card_picture_answer(entity, url, number);
+  } else if (view == "psaver") {  // the pictures of a plugin's screensaver (plugin API 0.14)
+    plugin_host::saver_picture_answer(entity, url, number);
   } else if (url.empty()) {  // announced before its alert
     alert_announced = entity;
     alert_announced_at = now;
@@ -12037,12 +12201,45 @@ inline std::string camera_key() {
   if (camera_map_index >= 0) key += "|" + map_focus + (theme::dark ? "|dark" : "") + (map_move.none() ? "" : "|" + map_move.text());
   // The cover's colour only shows beside a cover on long glass (saver_view::shape): on square glass it is no new picture.
   if (saver_camera) {
-    key += "|saver|" + saver_now.picture;
+    key += "|saver|" + saver_now.picture + (saver_now.motion ? "|moves" : "");
     if (saver_view::shape(overlay_card::screen_width(), overlay_card::screen_height()) != saver_view::Shape::fill) key += "|" + saver_now.ground;
   }
   return key;
 }
 inline std::string camera_tag() { return (saver_camera ? "saver|" : "full|") + camera.entity; }
+// A photo of the screensaver that moves (app 0.4.89, picture_motion.h): the app cut it larger than the glass, and the
+// glass shows its piece of it, a pixel further every PIXEL_MS. One that came at the glass's size (a screen whose memory
+// has no room for the larger one) stands still, as every other picture of the screensaver.
+inline picture_motion::Path saver_motion;
+inline uint32_t saver_motion_since = 0;
+inline picture_motion::Offset saver_motion_shown{-1, -1};
+inline void saver_motion_place(uint32_t now) {
+  if (!camera_picture || !saver_motion.moves()) return;
+  const auto o = picture_motion::at(saver_motion, now - saver_motion_since);
+  if (o.x == saver_motion_shown.x && o.y == saver_motion_shown.y) return;
+  saver_motion_shown = o;
+  lv_image_set_offset_x(camera_picture, -o.x);
+  lv_image_set_offset_y(camera_picture, -o.y);
+}
+inline void saver_motion_start(const lv_image_dsc_t *src) {
+  const int width = overlay_card::screen_width(), height = overlay_card::screen_height();
+  saver_motion = saver_now.kind == "photos" && saver_now.motion && src
+                     ? picture_motion::path(src->header.w, src->header.h, width, height, saver_now.picture)
+                     : picture_motion::Path{};
+  saver_motion_shown = {-1, -1};
+  if (!camera_picture) return;
+  if (!saver_motion.moves()) {
+    lv_image_set_offset_x(camera_picture, 0);
+    lv_image_set_offset_y(camera_picture, 0);
+    lv_image_set_inner_align(camera_picture, LV_IMAGE_ALIGN_COVER);
+    return;
+  }
+  lv_image_set_inner_align(camera_picture, LV_IMAGE_ALIGN_TOP_LEFT);
+  saver_motion_since = esphome::millis();
+  saver_motion_place(saver_motion_since);
+}
+// Every 250 ms (tick): the next pixel, only when it is due.
+inline void saver_motion_tick(uint32_t now) { if (saver_camera) saver_motion_place(now); }
 // The full view's picture is here, or not.
 inline void view_done(picture_loader::Outcome outcome) {
   if (!camera_root) return;
@@ -12058,11 +12255,12 @@ inline void view_done(picture_loader::Outcome outcome) {
   camera.shown = true;
   const bool first = camera_picture == nullptr;
   camera_show(camera_root, camera_picture, src, outcome == picture_loader::Outcome::LOADED);
+  if (camera_picture && saver_camera) saver_motion_start(src);
   if (first && camera_picture && saver_camera) {
     // The screensaver's picture is the whole glass; one that came smaller (the size cap, picture_store::MAX_BYTES) is
-    // scaled to it, the same proportions. Its words lie over it.
+    // scaled to it, the same proportions. Its words lie over it. A photo that moves shows the glass's piece of it.
     lv_obj_set_size(camera_picture, lv_pct(100), lv_pct(100));
-    lv_image_set_inner_align(camera_picture, LV_IMAGE_ALIGN_COVER);
+    if (!saver_motion.moves()) lv_image_set_inner_align(camera_picture, LV_IMAGE_ALIGN_COVER);
     saver_words();
   } else if (camera_picture && saver_camera && saver_words_due) {
     // The next track's picture is on the glass: its words come with it (saver_follow).
@@ -12315,6 +12513,7 @@ inline void pictures_round() {
   if (media_library::picture_want(library)) loader.want(owners::LIBRARY, std::move(library));
   card_picture_wants();
   plugin_host::card_picture_want();
+  plugin_host::saver_picture_want();
   // Never under a finger, and not between two quick page turns (camera_view::settled): a download that starts then is
   // for a page on its way past. Asking the app is an event and goes at once.
   auto *input = lv_indev_get_next(nullptr);
@@ -12342,9 +12541,16 @@ inline uint32_t saver_ticked = 0;
 // stand there all evening, and the Wi-Fi and Home Assistant need not fetch a picture every four seconds for it.
 constexpr uint32_t SAVER_CAMERA_MS = 15000;
 
+// The steps whose picture is the full view's (one picture of the whole glass the app made): a cover, a photo, a camera.
+inline bool saver_picture_kind(const std::string &kind) { return kind == "media" || kind == "photos" || kind == "camera"; }
+// A plugin draws this word (plugin API 0.14): a face of the step this screen has, or a plugin's step of its own. A face
+// the screen lacks (the plugin left it) leaves the step's own face.
+inline bool saver_plugin_draws(const SaverChoice &c) { return !c.plugin.empty() && plugin_host::saver_known(c.plugin); }
 inline bool saver_wanted() {
   const auto &kind = saver_next.kind;
-  return kind == "clock" || ((kind == "media" || kind == "camera") && camera_supported() && valid_entity(saver_next.entity));
+  if (kind == "plugin") return saver_plugin_draws(saver_next);
+  return kind == "clock" || (saver_picture_kind(kind) && camera_supported() &&
+                             (valid_entity(saver_next.entity) || saver_next.entity == SAVER_PHOTOS));
 }
 inline lv_obj_t *saver_text(lv_obj_t *parent, const lv_font_t *font, uint32_t color, const media_card::Rect &r, const std::string &text,
                             lv_text_align_t align = LV_TEXT_ALIGN_CENTER) {
@@ -12469,6 +12675,10 @@ inline saver_view::Keys saver_key_layout() {
 // white over the darkened picture or the cover's colour.
 inline void saver_words() {
   if (!camera_root || !saver_camera) return;
+  // Under a plugin's face the picture stands alone: the face draws its own words and keys.
+  if (saver_bare) { saver_words_due = false; return; }
+  // A photo stands alone: no words, no keys (app 0.4.89).
+  if (saver_now.kind == "photos") { saver_words_due = false; return; }
   const auto &c = saver_now;
   const int width = overlay_card::screen_width(), height = overlay_card::screen_height();
   const bool large = ui::large();
@@ -12538,11 +12748,62 @@ inline void saver_send(const char *service, const char *key = nullptr, const cha
   esphome::api::global_api_server->send_homeassistant_action(request);
   ESP_LOGI("saver", "key %s%s%s for %s", service, value ? " " : "", value ? value : "", saver_now.entity.c_str());
 }
-inline void saver_mute(bool muted, uint32_t now) {
-  saver_send("media_player.volume_mute", "is_volume_muted", muted ? "true" : "false");
-  saver_now.muted = muted;
-  saver_flipped = now ? now : 1;
+// What a finger changed on the screensaver's player (its keys, or a plugin's face through tessera::wish, plugin API
+// 0.14), shown at once and squared with Home Assistant's word by optimistic.h's rules, as every control's
+// (docs/OPTIMISTIC.md): the app's next word that still says the old value keeps the wish in front, the value wished
+// ends it, and silence puts the old value back. The player is no tile of the page (a speaker in another room), so the
+// wish reads and writes the screensaver's word where a tile's wish reads and writes the tile.
+inline optimistic::Pool<2> saver_wishes;
+inline std::string saver_read(const SaverChoice &c, optimistic::Field f) {
+  if (f == optimistic::Field::PLAYING) return c.state == "playing" ? "1" : "0";
+  if (f == optimistic::Field::MUTED) return c.muted ? "1" : "0";
+  return {};
+}
+inline void saver_write(SaverChoice &c, optimistic::Field f, const std::string &value) {
+  if (f == optimistic::Field::PLAYING) c.state = value == "1" ? "playing" : "paused";
+  else if (f == optimistic::Field::MUTED) c.muted = value == "1";
+}
+// The glass shows the wished value: the keys' faces, and a plugin's face hears it in its on_state.
+inline void saver_wish_show() {
   saver_faces();
+  plugin_host::saver_refresh();
+}
+inline void saver_wish_tick(uint32_t now) {
+  for (auto &w : saver_wishes.wishes) {
+    if (w.phase == optimistic::Phase::IDLE) continue;
+    const auto outcome = optimistic::tick(w, now);
+    if (outcome == optimistic::Outcome::SEND) {
+      if (w.entity == saver_now.entity) saver_send(w.service.c_str(), w.key.empty() ? nullptr : w.key.c_str(), w.value.c_str());
+      optimistic::sent(w, false);
+    } else if (outcome == optimistic::Outcome::REVERT && w.entity == saver_now.entity) {
+      ESP_LOGI("saver", "%s back to '%s' (no word from Home Assistant)", w.entity.c_str(), w.before.c_str());
+      saver_write(saver_now, w.field, w.before);
+      saver_wish_show();
+    }
+  }
+}
+// A finger's wish for the player on the glass: `value` in optimistic::Field's words, and the action that makes it so.
+inline bool saver_wish(optimistic::Field field, const std::string &value, const char *service, const char *key = "",
+                       const char *data = "") {
+  if (!fresh() || saver_now.kind != "media" || !valid_entity(saver_now.entity) || !service) return false;
+  auto &w = saver_wishes.slot(saver_now.entity, field);
+  optimistic::want(w, saver_now.entity, saver_now.entity, field, saver_read(saver_now, field), value, esphome::millis());
+  w.service = service; w.key = key ? key : ""; w.value = data ? data : "";
+  ESP_LOGI("saver", "wish %s: '%s' (was '%s')", saver_now.entity.c_str(), value.c_str(), w.before.c_str());
+  saver_write(saver_now, field, value);
+  saver_wish_show();
+  saver_wish_tick(esphome::millis());  // a choice goes out now, unless one is on its way
+  return true;
+}
+// The app's next word for the player: a wish still on its way stays in front of a word from before it.
+inline void saver_wish_reported(SaverChoice &next) {
+  for (auto &w : saver_wishes.wishes) {
+    if (!w.live() || w.entity != next.entity || next.kind != "media") continue;
+    if (optimistic::report(w, saver_read(next, w.field)) == optimistic::Outcome::KEEP) saver_write(next, w.field, w.want);
+  }
+}
+inline void saver_mute(bool muted) {
+  saver_wish(optimistic::Field::MUTED, muted ? "1" : "0", "media_player.volume_mute", "is_volume_muted", muted ? "true" : "false");
 }
 inline void saver_key_event(lv_event_t *e) {
   const int n = (int) (intptr_t) lv_event_get_user_data(e);
@@ -12554,25 +12815,22 @@ inline void saver_key_event(lv_event_t *e) {
     if (!saver_pressed || now - saver_pressed < SAVER_MUTE_HOLD_MS || saver_now.muted ||
         !(saver_now.features & tile_controls::feature::MEDIA_VOLUME_MUTE)) return;
     saver_pressed = 0;
-    if (allowed(now, 703, "screensaver mute")) saver_mute(true, now);
+    if (allowed(now, 703, "screensaver mute")) saver_mute(true);
     return;
   }
   if (n == 2) {
     if (!allowed(now, 700, "screensaver play")) return;
-    saver_send("media_player.media_play_pause");
-    saver_now.state = saver_now.state == "playing" ? "paused" : "playing";
-    saver_flipped = now ? now : 1;
-    saver_faces();
+    saver_wish(optimistic::Field::PLAYING, saver_now.state == "playing" ? "0" : "1", "media_player.media_play_pause");
     return;
   }
   // A volume key, on the release: the hold that muted used this contact up, so it does not also step.
   if (!screen_input::touch_guard.accept_repeat(now, 701 + n)) return;
-  if (saver_now.muted) { saver_mute(false, now); return; }
+  if (saver_now.muted) { saver_mute(false); return; }
   saver_send(n == 0 ? "media_player.volume_up" : "media_player.volume_down");
 }
 inline void saver_keys_draw() {
   for (lv_obj_t *&key : saver_keys) if (key) { lv_obj_delete(key); key = nullptr; }
-  if (!camera_root || !saver_camera || saver_now.kind != "media") return;
+  if (!camera_root || !saver_camera || saver_bare || saver_now.kind != "media") return;
   const auto l = saver_key_layout();
   const uint32_t ink = media_ink();
   const lv_font_t *small = mini_icon_font ? mini_icon_font : detail_font;
@@ -12612,6 +12870,7 @@ inline void saver_keys_draw() {
 
 inline void saver_hide() {
   saver_follow_due = false;
+  plugin_host::saver_hide();
 #ifdef SD_MOD_CLOCK_FACES
   clock_faces::forget();
 #endif
@@ -12619,11 +12878,54 @@ inline void saver_hide() {
   saver_root = nullptr;
   if (saver_camera) camera_close();
   saver_camera = false;
+  saver_bare = false;
   saver_now = SaverChoice{};
   saver_pictures = false;
 }
+// The glass the screensaver draws on itself (the clock, a plugin's saver): black, the whole of it, on the top layer under
+// an alert, with nothing that takes a tap (a plugin's parts that do take theirs, ui::takes_taps).
+inline lv_obj_t *saver_glass() {
+  auto *root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(root);
+  lv_obj_remove_flag(root, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(root, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(root, theme::color(theme::CAMERA_PAGE), 0);
+  lv_obj_move_to_index(root, 0);
+  return root;
+}
 inline void saver_show() {
   saver_now = saver_next;
+  // A plugin's face or step (plugin API 0.14): the plugin draws on the glass; the step's picture is a place of its own
+  // (saver:picture), loaded by the plugin host, so the full view stays closed.
+  if (saver_plugin_draws(saver_now)) {
+    saver_pictures = camera_supported();
+    // A face with the step's own picture under it (`backdrop`): the full view as Tessera's own face opens it, bare, and
+    // the plugin's glass clear over it, under an alert.
+    if (plugin_host::saver_backdrop(saver_now.plugin) && saver_picture_kind(saver_now.kind) && camera_supported()) {
+      saver_bare = saver_camera = true;
+      camera_open(saver_now.entity, saver_now.name, -1, "");
+      if (camera_root) {
+        lv_obj_remove_flag(camera_root, LV_OBJ_FLAG_CLICKABLE);
+        for (lv_obj_t **part : {&camera_back, &camera_title, &camera_spinner}) if (*part) { lv_obj_delete(*part); *part = nullptr; }
+        lv_obj_move_to_index(camera_root, 0);
+        if (saver_now.kind != "camera") camera.once = true;
+        else camera.every = SAVER_CAMERA_MS;
+      } else {
+        saver_bare = saver_camera = false;
+      }
+    }
+    saver_root = saver_glass();
+    if (saver_bare) {
+      lv_obj_set_style_bg_opa(saver_root, LV_OPA_TRANSP, 0);
+      lv_obj_move_to_index(saver_root, 1);
+    }
+    plugin_host::saver_show(saver_root, saver_now.plugin, saver_now.plugin_data, standby_level(),
+                            screen_settings::current.night(minute_of_day()));
+    ESP_LOGI("saver", "%s by %s", saver_now.kind.c_str(), saver_now.plugin.c_str());
+    return;
+  }
   saver_pictures = saver_now.kind != "clock";
   if (saver_pictures) {
     // The full view, asked for as the screensaver's picture (camera_request adds what it shows), then stripped of its
@@ -12634,19 +12936,13 @@ inline void saver_show() {
     lv_obj_remove_flag(camera_root, LV_OBJ_FLAG_CLICKABLE);
     for (lv_obj_t **part : {&camera_back, &camera_title, &camera_spinner}) if (*part) { lv_obj_delete(*part); *part = nullptr; }
     lv_obj_move_to_index(camera_root, 0);
-    // A camera refreshes at its pace; a cover loads once, and a new track is a new picture (saver_sync).
-    if (saver_now.kind == "media") camera.once = true;
+    // A camera refreshes at its pace; a cover and a photo load once, and the next is a new picture (saver_sync).
+    if (saver_now.kind != "camera") camera.once = true;
     else camera.every = SAVER_CAMERA_MS;
     ESP_LOGI("saver", "%s %s", saver_now.kind.c_str(), saver_now.entity.c_str());
     return;
   }
-  saver_root = lv_obj_create(lv_layer_top());
-  lv_obj_remove_style_all(saver_root);
-  lv_obj_remove_flag(saver_root, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_remove_flag(saver_root, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_size(saver_root, lv_pct(100), lv_pct(100));
-  lv_obj_set_style_bg_opa(saver_root, LV_OPA_COVER, 0);
-  lv_obj_move_to_index(saver_root, 0);
+  saver_root = saver_glass();
   saver_clock_draw();
   ESP_LOGI("saver", "clock");
 }
@@ -12670,7 +12966,7 @@ inline void saver_follow() {
   saver_now = saver_next;
   saver_keys_draw();  // the keys are the next player's at once; its words wait for its picture
   camera.open(saver_now.entity);
-  if (saver_now.kind == "media") camera.once = true;
+  if (saver_now.kind != "camera") camera.once = true;
   else camera.every = SAVER_CAMERA_MS;
   saver_words_due = true;
   ESP_LOGI("saver", "%s %s, the last picture stays until it comes", saver_now.kind.c_str(), saver_now.entity.c_str());
@@ -12678,16 +12974,30 @@ inline void saver_follow() {
 inline void saver_follow_pending() {
   if (!std::exchange(saver_follow_due, false)) return;
   if (saver_lit && saver_camera && camera_root && camera_picture && !(saver_next == saver_now) &&
-      (saver_next.kind == "media" || saver_next.kind == "camera")) saver_follow();
+      saver_picture_kind(saver_next.kind) && (!saver_plugin_draws(saver_next) || saver_bare)) saver_follow();
 }
 // apply_screen_settings, after every change and every minute: `lit` is standby with a backlight that is on.
 inline void saver_sync(bool lit) {
   saver_lit = lit;
   const bool shown = saver_root || saver_camera;
   if (!lit || !saver_wanted()) { if (shown) saver_hide(); return; }
-  // The camera and the cover stand as they are while nothing changed; the clock is drawn again, a minute later.
-  if (shown && saver_next == saver_now && saver_now.kind != "clock") return;
-  if (saver_camera && camera_root && camera_picture && (saver_next.kind == "media" || saver_next.kind == "camera")) { saver_follow(); return; }
+  // The camera and the cover stand as they are while nothing changed; the clock is drawn again, a minute later. A
+  // plugin's saver stays and draws on its own clock (on_tick).
+  if (shown && saver_next == saver_now && (saver_now.kind != "clock" || !saver_now.plugin.empty())) return;
+  // The same plugin's saver for the same step with a new word: it paints that in place (on_state).
+  if (saver_root && !saver_now.plugin.empty() && saver_next.plugin == saver_now.plugin && saver_next.kind == saver_now.kind &&
+      saver_plugin_draws(saver_next)) {
+    // Its backdrop follows the next cover or photo as Tessera's own face does (the last stays until it comes).
+    if (saver_bare && camera_root && camera_picture && (saver_next.entity != saver_now.entity ||
+        saver_next.picture != saver_now.picture || saver_next.motion != saver_now.motion)) saver_follow();
+    else saver_now = saver_next;
+    plugin_host::saver_state(saver_now.plugin_data);
+    return;
+  }
+  if (saver_camera && camera_root && camera_picture && saver_picture_kind(saver_next.kind) && !saver_plugin_draws(saver_next)) {
+    saver_follow();
+    return;
+  }
   saver_hide();
   saver_show();
 }
@@ -12700,7 +13010,8 @@ inline void saver_wake() {
 // A new layout on its way (cancel_layout_input): every picture goes; saver_tick draws the screensaver again.
 inline void saver_forget() { saver_hide(); }
 // The app's word (page_receiver.cpp). In standby the glass follows at once, through apply_screen_settings.
-inline void saver_receive(const SaverChoice &next) {
+inline void saver_receive(SaverChoice next) {
+  saver_wish_reported(next);
   if (next == saver_next) return;
   saver_next = next;
   if (!awake() && saver_changed) saver_changed();
@@ -12708,16 +13019,6 @@ inline void saver_receive(const SaverChoice &next) {
 inline void saver_tick(uint32_t now) {
   if (now - saver_ticked < 1000) return;
   saver_ticked = now;
-  // A play key that turned ahead of Home Assistant and heard nothing shows what the app last said again.
-  if (saver_flipped && now - saver_flipped > 5000) {
-    saver_flipped = 0;
-    if (saver_camera && saver_now.entity == saver_next.entity &&
-        (saver_now.state != saver_next.state || saver_now.muted != saver_next.muted)) {
-      saver_now.state = saver_next.state;
-      saver_now.muted = saver_next.muted;
-      saver_faces();
-    }
-  }
   // Gone under it (a new layout, an alert that closed the camera): drawn again.
   if (saver_lit && !saver_root && !saver_camera && saver_wanted()) saver_show();
 #ifdef SD_MOD_CLOCK_FACES
@@ -13014,6 +13315,8 @@ inline void cancel_layout_input(bool invalidate_widgets) {
   history = History{};
   if (invalidate_widgets) {
     for (auto &w : widgets) { w.index = grid.max_tiles(); w.cached_active = -1; }
+    // The next layout's cover cards start at their primary control: an index may be another cover's now.
+    cover_swapped.fill(0);
     forget_kept();
     if (layout_changed) layout_changed();
   }

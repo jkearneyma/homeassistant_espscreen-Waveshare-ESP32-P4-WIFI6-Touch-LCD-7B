@@ -8,7 +8,7 @@ import { computed, effectScope, onScopeDispose, reactive, ref, watch } from "vue
 import { getJson, send } from "../api";
 import { t } from "../i18n";
 import { boardTitle } from "../model/boards";
-import { attachLine, barItemView, barTypesOf, choiceKey, compareUrl, fit, isTest, nodeOf, ownYaml, pluginDefaults, pluginTileId, testPlugin,
+import { attachLine, barItemView, barTypesOf, choiceKey, pluginSaverKey, saverTypesOf, compareUrl, fit, isTest, nodeOf, ownYaml, pluginDefaults, pluginTileId, testPlugin,
   text, tileTypesOf, type AppFit, type Installed, type Plugin, type PluginTileOption, type Texts } from "../model/plugins";
 import type { Screen } from "../types";
 import { useBuildsStore } from "./builds";
@@ -26,7 +26,7 @@ export type Plan = {
 // from the tile's data, its first rows; asked again once a minute while a page shows it.
 export type PreviewRow = { badge?: string; title?: string; value?: string; at?: number };
 // ---- One line of state: for one screen (its tab), or over all screens (the page) ----
-export type Status = { kind: "installed" | "update" | "building" | "test" | "misfit" | "failed" | ""; label: string };
+export type Status = { kind: "installed" | "update" | "building" | "test" | "misfit" | "failed" | "missing" | ""; label: string };
 // A screen's changes set aside together, one build (the tray): the plugins to add and the ones to take off.
 export type TrayGroup = { screen: Screen; plugins: Plugin[]; removes: Plugin[] };
 type Payload = {
@@ -94,6 +94,16 @@ export const usePluginsStore = defineStore("plugins", () => {
   const pluginTileOf = (entity: string) => tileTypes.value.get(entity);
   /** A plugin's top bar item by its key (plugin:<plugin>.<item>), as the editor shows it. */
   const barItemOf = (key: string | undefined) => barItemView(key ? barTypes.value.get(key) : undefined);
+  // The screensavers of the plugins the editor knows (plugin API 0.14), by their key (plugin:<plugin>.<saver>).
+  const saverTypes = computed(() => saverTypesOf(index.value));
+  /** A plugin's screensaver by its key, also of a plugin that is not on the screen (any more). */
+  const saverOf = (key: string) => saverTypes.value.get(key);
+  /** The screensavers of the plugins this screen runs: a face of a step, or a step of its own. */
+  function saversFor(screen: Screen | undefined) {
+    if (!screen || screen.virtual) return [];
+    return index.value.filter((plugin) => installedOn(screen, plugin.id)).flatMap((plugin) =>
+      (plugin.savers || []).map((saver) => ({ key: pluginSaverKey(plugin.id, saver.id), plugin, saver })));
+  }
   /** Whether a plugin fits a screen, with what only the add-on knows about it there. */
   const fits = (plugin: Plugin, screen: Screen | null) => fit(plugin, screen, (screen && appFit.value[screen.id]) || {});
 
@@ -286,6 +296,9 @@ export const usePluginsStore = defineStore("plugins", () => {
       return { kind: "building", label: t(builds.buildOf(screen)?.state === "queued" ? "editor.plugins.state.queued" : "editor.plugins.state.building") };
     const have = installedOn(screen, plugin.id);
     if (have?.state === "failed") return { kind: "failed", label: t("editor.plugins.state.failed") };
+    // Built into the screen, but its last hello does not name it: it crashed at boot, or the screen runs a firmware built
+    // without it (Installed.running). Said before an update, which would not mend it.
+    if (have?.state === "active" && have.running === false) return { kind: "missing", label: t("editor.plugins.state.not_running") };
     if (hasUpdate(screen, plugin)) return { kind: "update", label: t("editor.plugins.state.update", { version: plugin.version }) };
     if (isTest(have)) return { kind: "test", label: t(`editor.plugins.source.${have!.source}`) };
     if (have) return { kind: "installed", label: t("editor.plugins.state.installed") };
@@ -563,7 +576,7 @@ export const usePluginsStore = defineStore("plugins", () => {
     // What the Plugins page, a screen's tab and the cards read as they draw (stores/lookup.ts); choicesFor, previewFor and
     // planOn answer at once and ask the add-on for what they do not have yet.
     ...lookups({
-      pluginTileOf, barItemOf, fits, choicesFor, choicesPending, previewFor, tapActionsFor, barItemsFor, entitiesIn, needsConsent, realScreens,
+      pluginTileOf, barItemOf, saverOf, saversFor, fits, choicesFor, choicesPending, previewFor, tapActionsFor, barItemsFor, entitiesIn, needsConsent, realScreens,
       otherOrigin, hasUpdate, updatesOn, tilesOn, partsOn, valueOf, needsAttach, pluginsFile, setupChanged, setupReady, secretSet, partsKb,
       installedOn, buildingOn, testsOn, allTests, labelOf, stageOf, statusOn, statusOverall, planOn, comesAlong, neededBy, canLike,
       isSetAside, isTakingOff, trayPlan, trayAlong, trayReady, setAsideKb, removalPlan, newsFrom, compareFor, screenLine,

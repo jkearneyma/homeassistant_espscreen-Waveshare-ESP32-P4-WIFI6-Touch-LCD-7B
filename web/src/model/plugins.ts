@@ -34,6 +34,15 @@ export type PluginTile = {
   entities?: string[];
 };
 
+// A plugin's screensaver (plugin API 0.14, docs/PLUGINS.md "A screensaver"): a face of the clock, the music or the photos
+// (`step`), or a step of its own in the order (`own`). Its options are drawn as a tile's are; `domains` names the entities
+// a step of its own belongs to; `pictures` and `taps` say whether it draws pictures and takes a tap. There is no picture
+// of it in the editor (it is the plugin's C++), so `example` says in words what it shows.
+export type PluginSaver = {
+  id: string; name: Texts; icon?: string; step: "clock" | "media" | "photos" | "own";
+  pictures?: number; taps?: boolean; domains?: string[]; options?: PluginTileOption[]; example?: Texts | null;
+};
+
 // The entities the inspector offers a tile of an entity: those the add-on found with the attributes it needs, and
 // always the one it has, which may lack them for a while (an entity that is unavailable has no attributes).
 export function offeredEntities<T extends { id: string }>(all: T[], tile: Pick<PluginTile, "entities">, chosen = ""): T[] {
@@ -43,10 +52,10 @@ export function offeredEntities<T extends { id: string }>(all: T[], tile: Pick<P
 }
 export type PluginSource = "index" | "link" | "branch" | "folder";
 export type PluginLabel = "tessera" | "community" | "test";
-// What a plugin adds, read by the add-on from its manifest (plugin_manifest.plugin_type): tiles to put on a page, something
-// for the whole screen, or a board's hardware. The Plugins page's tabs.
-export type PluginType = "tiles" | "functions" | "hardware";
-export const PLUGIN_TYPES: PluginType[] = ["tiles", "functions", "hardware"];
+// What a plugin adds, read by the add-on from its manifest (plugin_manifest.plugin_type): tiles to put on a page,
+// screensavers (plugin API 0.14), something for the whole screen, or a board's hardware. The Plugins page's tabs.
+export type PluginType = "tiles" | "screensavers" | "functions" | "hardware";
+export const PLUGIN_TYPES: PluginType[] = ["tiles", "screensavers", "functions", "hardware"];
 // What a plugin is about, in its maker's word (plugin_manifest.TOPICS): the chips under the tabs.
 export const PLUGIN_TOPICS = ["time", "weather", "calendar", "home", "energy", "travel", "money", "sports", "news", "media",
   "photos", "fun", "voice", "tech"] as const;
@@ -103,6 +112,7 @@ export type Plugin = {
   tap_actions?: { id: string; label: Texts; domains: string[] }[];
   bar_items?: { id: string; label: Texts; icon: string; example?: Texts | null }[];
   settings?: { key: string; label: Texts; status?: string | null }[];
+  savers?: PluginSaver[];
 };
 // A plugin on a screen, as the add-on keeps it (plugins.json): its source and commit, its parts and what was filled in
 // (never a secret), and its state: building, active, or failed with the reason.
@@ -112,6 +122,9 @@ export type Installed = {
   id: string; version: string; source: PluginSource; ref?: string | null; parts?: string[]; values?: Record<string, string>;
   origin?: string; branch?: string | null; auto?: boolean; blocked?: string | null;
   state?: "building" | "active" | "failed"; reason?: string | null;
+  // Whether the screen's last hello names it at this version (plugins.py runs): false is a plugin that crashed at boot
+  // or a firmware built without it; null while that cannot be known (offline, building, just built).
+  running?: boolean | null;
   // An update whose build failed: the screen went back to this record's version, and this is the one that did not build.
   failed_update?: { version: string; ref?: string | null; reason?: string | null };
   // Which of its secrets for this screen alone are set (never their values).
@@ -147,11 +160,19 @@ export function barTypesOf(index: Plugin[]) {
 /** A known bar item as the editor shows it: its label, icon and example in the editor's language, and its plugin's name. */
 export const barItemView = (known: PluginBarType | undefined) =>
   known ? { label: text(known.label), icon: known.icon, example: known.example ? text(known.example) : "", plugin: text(known.plugin.name) } : null;
+// A plugin's screensaver by its key (plugin:<plugin>.<saver>), from the same index.
+export type PluginSaverType = { plugin: Plugin; saver: PluginSaver };
+export const pluginSaverKey = (plugin: string, saver: string) => `plugin:${plugin}.${saver}` as const;
+export function saverTypesOf(index: Plugin[]) {
+  const types = new Map<string, PluginSaverType>();
+  for (const plugin of index) for (const saver of plugin.savers || []) types.set(pluginSaverKey(plugin.id, saver.id), { plugin, saver });
+  return types;
+}
 // The key of one list of choices: plugin, fetch, and the other options it is asked with (the plugins store keeps the lists).
 export const choiceKey = (plugin: Plugin, option: PluginTileOption, values: Record<string, unknown>) =>
   `${plugin.id}.${option.options_from}.${JSON.stringify(Object.entries(values).filter(([k]) => k !== option.id).sort())}`;
 // What a plugin tile's options are when nothing is chosen yet.
-export const pluginDefaults = (tile: PluginTile): Record<string, PluginValue> =>
+export const pluginDefaults = (tile: Pick<PluginTile, "options">): Record<string, PluginValue> =>
   Object.fromEntries((tile.options || []).filter((option) => option.default !== undefined).map((option) => [option.id, option.default!]));
 
 // ---- Values of JSON (plugin API 0.12) ----

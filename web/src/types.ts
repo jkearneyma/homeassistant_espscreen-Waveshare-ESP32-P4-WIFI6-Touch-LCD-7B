@@ -15,6 +15,8 @@ export type TileOptions = {
   controls?: string;
   inline?: string;
   guard?: string;
+  // Where a cover's slats stand open: "100" (Home Assistant's rule, never stored) or "50".
+  tilt_open?: string;
   tap?: string;
   icon?: string;
   background?: string;
@@ -100,7 +102,7 @@ export type PageTile = {
     calendarWeekStart?: string; calendarHours?: [number, number]; calendarWeekNumbers?: boolean; calendarBookOn?: string; calendarBookPlace?: string; calendarBookTitle?: string;
     // A sensor's meter (firmware 0.56.0): TileOptions' meter, min, max, segments, colors and thresholds.
     meterStyle?: string; meterMin?: number; meterMax?: number; meterSegments?: number; meterColors?: string[]; meterThresholds?: number[] };
-  interaction: { tap?: string; inline?: string; controls?: string; action?: TileOptions["action"]; guard?: string; play?: FavoritePlay; speaker?: string; shuffle?: string; repeat?: string };
+  interaction: { tap?: string; inline?: string; controls?: string; action?: TileOptions["action"]; guard?: string; play?: FavoritePlay; speaker?: string; shuffle?: string; repeat?: string; tilt_open?: string };
   children?: ChildTile[];
 };
 export type Page = {
@@ -148,14 +150,27 @@ export type UpdateInfo = {
 // The screensaver (app 0.4.48): a player, a camera and the order the screen tries them in, the clock a step of its own.
 // `ready`: the screen's firmware takes one; `pictures`: its board draws pictures, else the clock alone; `standby`: it
 // goes into standby at all.
-export type SaverKind = "media" | "camera" | "clock";
+// `photos` (app 0.4.89): photos from a folder of Home Assistant's media, a step of its own after the music.
+export type SaverKind = "media" | "photos" | "camera" | "clock";
+// A plugin's screensaver (plugin API 0.14): a face of a step above, or a step of its own in the order, `plugin:<plugin>.<saver>`.
+export type PluginSaverKey = `plugin:${string}.${string}`;
+// A step in the order: one of the screen's own, or a plugin's (at most four of those).
+export type SaverStep = SaverKind | PluginSaverKey;
+// The photos step: the media source folder ('' for none yet), how many seconds a photo stands, in what order they come
+// and how one fills the glass (`auto` fills it with a photo of about its shape and shows another whole).
+export type SaverPhotos = { source: string; every: number; order: "shuffle" | "in_order"; fit: "auto" | "fill" | "whole"; motion?: "still" | "slow" };
+// What a plugin's face or step keeps: its options as a plugin's tile keeps them, and the entity it belongs to.
+export type SaverPluginSetting = { options: Record<string, PluginValue>; entity: string };
 // `weather` (app 0.4.52): the temperature under the clock, "auto" for Home Assistant's first weather entity, "" for none.
 // `more` (app 0.4.54): the players the music step tries after `media`, in their order.
-// `face` and the rest (module clock_faces): the clock's face, Glass's numerals, the seconds hand and the face's look.
-export type ScreensaverChoice = { show: boolean; media: string; camera: string; order: SaverKind[]; off: SaverKind[]; weather?: string; more?: string[]; items?: HeaderItem[];
-  face?: "digital" | "glass" | "classic" | "bauhaus"; numerals?: number; seconds?: boolean; look?: "dark" | "light" | "auto" };
-// `faces`: the screen's board has the clock's faces (docs/MODULES.md).
-export type ScreensaverView = ScreensaverChoice & { ready: boolean; pictures: boolean; standby: boolean; faces?: boolean };
+// `face` and the rest (module clock_faces): the clock's face, Glass's numerals, the seconds hand and the face's look;
+// `face` may also be a plugin's face of the clock, and `media_face`, `photos_face` a plugin's face of those steps ('' for
+// the screen's own). `plugins`: the options and entity of each plugin face or step, by its key.
+export type ScreensaverChoice = { show: boolean; media: string; camera: string; order: SaverStep[]; off: SaverStep[]; weather?: string; more?: string[]; items?: HeaderItem[];
+  face?: "digital" | "glass" | "classic" | "bauhaus" | PluginSaverKey; numerals?: number; seconds?: boolean; look?: "dark" | "light" | "auto";
+  photos?: SaverPhotos; media_face?: "" | PluginSaverKey; photos_face?: "" | PluginSaverKey; plugins?: Record<string, SaverPluginSetting> };
+// `faces`: the screen's board has the clock's faces (docs/MODULES.md). `photos_step`: the screen's firmware takes the photos step.
+export type ScreensaverView = ScreensaverChoice & { ready: boolean; pictures: boolean; standby: boolean; faces?: boolean; photos_step?: boolean };
 export type SettingsView = { owner: string; keys: string[]; values: Record<string, any>; unavailable: string[]; rotations?: number[]; switches?: string[]; calibrate?: boolean };
 // The two ways a screen can hang (app 0.2.107), chosen when it is built: lying down or standing up. A board's own
 // numbers for each way come from boards.json, which the add-on serves with the firmware status.
@@ -286,7 +301,25 @@ export type IconInfo = { name: string; cp: string; label: string };
 export type Build = {
   id?: number; by: "update" | "plugins" | "install"; state: "queued" | "running"; place?: number; file?: string | null;
   stage?: string | null; phase?: string | null; plugins?: string[];
+} & ServerSide;
+// Where a build's compile runs (the add-on's build_server.py): `server` with the build server's name and its step
+// (`remote`), or `here` after a fallback, with the reason (`fallback`, editor.build.server.fallback.<reason>).
+export type ServerSide = { where?: "server" | "here" | null; server?: string | null; remote?: BuildServerStep | null; fallback?: string | null };
+export type BuildServerStep = "bundle" | "send" | "queued" | "build" | "fetch";
+export type Fingerprint = { emoji: string; name: string }[];
+// The build server as the add-on keeps it (build_server.BuildServer.view): paired or not, on or off, there or not.
+export type BuildServerView = {
+  rev: number; available: boolean; enabled: boolean; esphome: string;
+  own: { pin: string; emoji: Fingerprint };
+  server: { host: string; port: number; name: string; esphome: string; state: "paired" | "pending"; since: number; emoji: Fingerprint } | null;
+  connection: "off" | "connecting" | "online" | "offline" | "refused" | "mismatch"; error: string;
+  queue: { idle: boolean; running: boolean; queue_depth: number } | null;
+  building: { file: string; phase: BuildServerStep; started: number } | null;
+  last: { file: string; where: "server" | "here"; server: string; seconds?: number; reason?: string; failed?: boolean; at: number } | null;
 };
+// What Look it up finds at an address: the server's name, its ESPHome, its fingerprint, and whether it wants the one-time
+// key a headless server prints.
+export type BuildServerPreview = { host: string; port: number; pin: string; name: string; esphome: string; needs_key: boolean; provisions: boolean; emoji: Fingerprint };
 // One build of the add-on's build line (the live inventory's `line`, build_queue.BuildQueue.view): what runs, what waits
 // in order and the last ones that ended, newest first. `check` is a YAML check. While it waits, `place` is its turn and
 // `after` the profile that builds now; while it runs, ESPHome's `stage` and the build's `memory`; once it ended, why
@@ -297,7 +330,7 @@ export type LineBuild = {
   state: LineState; asked: number; started: number | null; finished: number | null; phase?: string | null; plugins?: string[];
   place?: number; after?: string | null; stage?: string | null; memory?: import("./model/install-progress").BuildMemory | null;
   reason?: string | null;
-};
+} & ServerSide;
 export type Inventory = {
   editor_features?: { tall_tiles?: boolean; plugins?: boolean };
   csrf?: string;
@@ -317,6 +350,8 @@ export type Inventory = {
   // The add-on's build line (build_queue.py, docs/BUILDS.md): what runs, what waits and the last that ended (newest
   // first), from the same look at the line as `builds`, in every live answer.
   line?: LineBuild[];
+  // The build server (build_server.py, docs/BUILDS.md "On a build server"), in every live answer.
+  build_server?: BuildServerView;
   // The CHANGELOG by release, newest first: only in the full inventory, not in the live payload (app 0.2.78).
   changelog?: ChangelogSection[];
   claude_skill?: { path: string; installed: boolean; current: boolean; restart?: boolean };

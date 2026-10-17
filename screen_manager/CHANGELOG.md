@@ -1,5 +1,80 @@
 ## Unreleased
 
+- **A new screen swipes out of the box.** A screen set up with New screen now has Swipe between pages on from the
+  start, so it swipes through its pages, opens its settings from the top edge and opens the Dock from the bottom edge
+  without turning anything on first. Screens you already have keep the setting they have through the update. Turn it
+  off under the screen's Settings, Swipe between pages.
+
+## 0.4.89 (firmware 0.57.0)
+
+- **A thermostat's state line no longer runs into its card.** On screens with dense glass (the Waveshare P4 and
+  the Tab5) a thermostat with many modes and a fan row drew "Heat · Now ..." against the top of the card with its
+  - and + keys. The line now gets the room its text needs.
+- **A screen whose Override YAML was deleted builds again.** ESPHome Device Builder lists a screen's Override YAML
+  (`<name>.local.yaml`) as a device of its own, and deleting that entry there left the screen's YAML including a file
+  that was gone, so every update stopped with "file not found". The app now writes the missing file again, empty, when
+  it starts and before every build. Overrides that were in it are not brought back.
+- **Photos as a screensaver.** The screensaver has a new step, Photos: the photos of a folder of Home Assistant's
+  media, one after the other over the whole glass. Pick an album, a person or a tag of Immich, a folder under
+  Home Assistant's media, or Synology Photos; choose how long each stands, shuffled or in order, and whether a photo
+  fills the glass or shows whole, and whether it stands still or moves slowly across the glass. iPhone photos are read
+  too. Screens that show pictures only.
+- **Screensavers from plugins.** A plugin can now bring its own face for the clock, the music or the photos, or a step
+  of its own in the screensaver's list, with keys you can tap without waking the screen. A screen without that plugin
+  keeps the step's own face.
+- **The screensaver's play and mute keys follow Home Assistant as every key does.** They show their change at once and
+  go back when Home Assistant does not follow, by the same rules as the keys on the pages.
+- **Build on a faster computer.** Settings has a Build server card now: pair Tessera with ESPHome Desktop, ESPHome
+  Device Builder or a headless `esphome-device-builder --remote-build-only` on a computer on your network, compare its
+  fingerprint, and every screen's firmware is compiled there instead of on your Home Assistant machine: updates, plugin
+  builds, New screen and Firmware & USB. The server builds with the same ESPHome version as the app (it installs that
+  version once, beside its own), plugins from a folder go along, and the installing, the bridge on 4 MB boards and the
+  download stay as they were. The card shows whether the server is there and what it builds, every build says where it
+  runs, and when the server is off, away or cannot build it, the build simply runs here as before and says why. A
+  build takes the screen's own YAML and secrets (its Wi-Fi password and keys) along to the server, encrypted to the
+  key you paired, and to no other computer.
+
+- **A cover shows that it is on its way.** A blind, curtain or garage door sent somewhere no longer jumps back to
+  where it was while it moves: from the tap on, its tile and card show where it goes and say Opening or Closing, the
+  slider's handle steps aside and a thin stripe glides over the slider in the direction it moves, until Home Assistant
+  reports it there or stopped. The slider still takes a finger, so a cover sent the wrong way can be turned around at
+  once, and the slats' tilt works the same way.
+- **Slats that are open at 50 %.** Home Assistant counts a blind's tilt from 0 (closed) to 100 (fully open), and the
+  screen draws its slats that way. Some blinds are open at 50 % and closed at 0 % and 100 %, one way and the other
+  (the SwitchBot Blind Tilt among them). A cover tile with slats now has the choice "Slats open at 50 %" in the editor:
+  the slats then stand flat at 50 and turn one way below it and the other way above it, open goes to 50, and close
+  goes to the nearer closed side. Home Assistant's way stays the default.
+- **A screen follows Home Assistant to another time zone.** Home Assistant's ESPHome integration tells a screen its
+  time zone only when it connects, so a screen kept the old hour after the time zone changed in Home Assistant (a
+  home on wheels crossing one) until Home Assistant restarted. The app now reloads each screen's integration when the
+  time zone changes, and the screens show the new hour within seconds.
+- **The editor remembers where you are.** The open screen, the page of the app and a screen's Override YAML are in the
+  page's address now: a reload opens the same screen again, the browser's Back and Forward go through what you had
+  open, and a link to a screen can be kept. Leaving a screen with unsaved changes by the address bar asks first, as the
+  sidebar does. Older links such as `#settings` still work.
+
+- **A plugin's README fits a phone.** A README with a table no longer made the plugin's details wider than the screen;
+  the text wraps to the width of the phone and a wide table or code block scrolls on its own.
+- **A tile added from Home Assistant no longer undoes a save made at the same moment.** An automation's tile event
+  waits on Home Assistant for the entity's capabilities; a save from the editor during that wait is kept now, and the
+  tile is placed on the new layout.
+- **The Plugins tab says when a screen does not run a plugin.** A plugin the app built into a screen that the screen
+  itself does not report, because it crashed at boot or the firmware on it was built without it, shows "Not running on
+  the screen" instead of "Installed".
+- **A plugin the firmware refuses by its API is named.** When a screen's update stops because a plugin was written for
+  another plugin API, the message names that plugin and offers its update, as it already did for a compiler error.
+- **The weather card and its chart agree on their colours.** A clear night, lightning with rain and snow with rain had
+  another colour on the card's icon than in the chart beside it; every weather colour comes from one table now.
+- **The overview opens fewer connections.** The small still screens on the overview take the normal refresh instead
+  of a live stream each, so a home with many screens keeps connections free for the editor itself.
+- **The compile cache is checked against GitHub's digest.** The prebuilt compile cache a build fetches is unpacked only
+  when its checksum matches the one GitHub names for it.
+
+- **Every file of the app is written whole or not at all.** The layouts, the settings, the plugins and now the Wi-Fi
+  secrets of your screens too are written to a temporary file first and swapped in one step, so a power cut or a stop
+  during a save never leaves half a file. A file the app cannot read is set aside beside the new one instead of being
+  started over, and a file written by a newer version of the app is left exactly as it is.
+
 - **A plugin's build no longer sees the app's own keys.** ESPHome runs a plugin's component while it builds a screen,
   inside this app. That build now gets only the environment the compilers read, never the token the app holds for Home
   Assistant or anything else of the app's own. The warning before you add a plugin now says where its code runs: on the
@@ -83,8 +158,9 @@
 - **The Dock: swipe up for every page at once.** On every board with 8 MB of flash or more, a swipe up from the bottom
   edge now opens the Dock, a drawer with all pages as small pictures with their names, in two rows. It comes up with
   your finger and opens the rest of the way when you let go (pulled up only a little, it falls back). A tap on the
-  page dots at the bottom opens it as well. Tap a page to go there, drag it down to close it, or swipe up once more to go home. The CYD and the other 4 MB boards keep going home on that swipe and get none of
-  its code, so their room for updates stays the same.
+  page dots at the bottom opens it as well. Tap a page to go there, drag it down to close it, or swipe up once more to go home. The swipes need Swipe between pages, which stays off until you turn it on under the screen's
+  settings. The CYD and the other 4 MB boards keep going home on that swipe and get none of its code, so their room
+  for updates stays the same.
 - **In the Dock, per page.** On a screen whose board has the Dock, a page's settings say how it stands there: its
   **Picture** (the default), an **Icon** of its own from the same icons as the tiles, or **Hidden**. A page left out of
   swiping is not in the Dock either.
@@ -115,9 +191,6 @@
 - **A new page asks what it needs.** The Add page window chooses the top bar with chips: the home key is on, and the
   clock and the screen's other items are a tap away instead of a clock on every new page. On a screen with the Dock it
   also asks how the page stands in the Dock: its picture, an icon, or hidden.
-- **Swipe between pages is on for a new screen.** A screen set up from now on can swipe through its pages, open the
-  settings from the top edge and open the Dock from the bottom edge without turning anything on first. A screen you
-  already have keeps the setting it has.
 - **A wide tile's slider lines up with the tiles above it (#250).** On a tile three cells wide or more, a player's
   volume, a brightness or a -/+ took only the last cell at the right end, a short slider where the editor showed half
   the tile. The first cell now keeps the name, as on a tile of one cell, and the control fills every cell after it, on
