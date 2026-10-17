@@ -3,7 +3,7 @@
 #
 # ESP Screen Manager writes every screen's own YAML with `packages: display: {url: <this repository>, files:
 # [packages/wavesharep47b.yaml]}` and adds the name, the Wi-Fi reference and the unique keys (docs/EASY_SETUP.md); nothing
-# of that lives here. The screen is two packages: core.yaml, which every board shares, and boards/waveshare-esp32p4-7b.yaml with this
+# of that lives here. The screen is two packages: core.yaml, which every board shares, and boards/wavesharep47b.yaml with this
 # board's hardware and sizes (docs/PROFILES.md). checkout/wavesharep47b.yaml builds the same two from a checkout.
 substitutions:
   # The branch the components and the fonts come from: main, or dev for a screen of the app's dev channel, which
@@ -13,7 +13,7 @@ substitutions:
 
 packages:
   core: !include core.yaml
-  board: !include boards/waveshare-esp32p4-7b.yaml
+  board: !include boards/wavesharep47b.yaml
   hotspot: !include features/hotspot.yaml
 
 external_components:
@@ -23,4 +23,4 @@ external_components:
       ref: ${GITHUB_REF}
       path: components
     refresh: 0s
-    components: [smart_display]
+    components: [es7210_extended, esp_aec, smart_display]
